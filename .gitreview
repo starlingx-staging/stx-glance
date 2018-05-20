@@ -1,5 +1,4 @@
 [gerrit]
 host=review.openstack.org
 port=29418
-project=openstack/glance.git
-defaultbranch=stable/pike
+project=openstack/stx-glance.git
