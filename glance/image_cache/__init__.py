@@ -26,9 +26,14 @@ from oslo_utils import excutils
 from oslo_utils import importutils
 from oslo_utils import units
 
+from glance.common import config
 from glance.common import exception
 from glance.common import utils
+from glance.context import RequestContext
+import glance.registry.client.v1.api as registry
 from glance.i18n import _, _LE, _LI, _LW
+
+from keystoneclient.v2_0 import client as keystoneclient
 
 LOG = logging.getLogger(__name__)
 
@@ -276,7 +281,13 @@ class ImageCache(object):
         Removes all cached image files above the cache's maximum
         size. Returns a tuple containing the total number of cached
         files removed and the total size of all pruned image files.
+
+        WRS specific:
+        Also removes images that are cached, but the original image
+        in the primary region/cloud has since been deleted
         """
+        self.get_orphaned_cached_images()
+
         max_size = CONF.image_cache_max_size
         current_size = self.driver.get_cache_size()
         if max_size > current_size:
@@ -440,3 +451,48 @@ class ImageCache(object):
         into the queue.
         """
         return self.driver.get_queued_images()
+
+    def get_orphaned_cached_images(self):
+        """
+        WRS specific
+        In case glance-caching is used, returns a list of images that
+        were cached, but the original source image has since been deleted
+        """
+
+        admin_context = self._get_context()
+        registry.configure_registry_client()
+        active_images = registry.get_images_list(admin_context)
+        cached_images = self.get_cached_images()
+
+        for c_image in cached_images:
+            if not (any(image['id'] == c_image['image_id']
+                        for image in active_images)):
+                LOG.info(_LI("Image %s no longer present in the "
+                         "primary region. Deleting cached file.")
+                         % str(c_image['image_id']))
+                self.delete_cached_image(c_image['image_id'])
+            else:
+                LOG.debug("Image %s still present in the "
+                          "primary region."
+                          % str(c_image['image_id']))
+
+    def _get_context(self):
+        # (sdinescu)
+        # This is the only way I found for this to properly load the
+        # keystone parameters when loaded as a standalone app (by
+        # using the glance-pruner) and when being used as part of
+        # glance-api process chain
+        config.load_paste_app('glance-api')
+
+        k_cfg = CONF.keystone_authtoken
+        auth = keystoneclient.Client(
+            username=k_cfg.username,
+            password=k_cfg.password,
+            tenant_name=k_cfg.project_name,
+            auth_url=k_cfg.auth_uri + "/v2.0")
+        return RequestContext(
+            auth_token=auth.session.get_token(),
+            user=k_cfg.username,
+            tenant=k_cfg.project_name,
+            show_deleted=True,
+            overwrite=False)

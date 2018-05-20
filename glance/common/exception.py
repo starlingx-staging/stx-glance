@@ -322,6 +322,10 @@ class SIGHUPInterrupt(GlanceException):
     message = _("System SIGHUP signal received.")
 
 
+class SIGUSR1Interrupt(GlanceException):
+    message = _("System SIGUSR1 signal received.")
+
+
 class RPCError(GlanceException):
     message = _("%(cls)s exception was raised in the last rpc call: %(val)s")
 
@@ -452,7 +456,36 @@ class MetadefTagNotFound(NotFound):
                 " namespace=%(namespace_name)s.")
 
 
+class CachingToRawException(GlanceException):
+    message = _("Error caching image to RAW: %(reason)s")
+
+
+class ImageUnacceptable(CachingToRawException):
+    message = _("Image %(image_id)s is unacceptable: %(reason)s")
+
+
+class ConvertToSameFormat(CachingToRawException):
+    message = _("Source and destination files have the same format: %(fmt)s")
+
+    def __init__(self, message=None, *args, **kwargs):
+        self.fmt = kwargs.get("fmt")
+        super(ConvertToSameFormat, self).__init__(message, *args, **kwargs)
+
+
+class ImageUncacheable(CachingToRawException):
+    message = _("Image %(image_id)s is uncacheable: %(reason)s")
+
+
+class InvalidRbdUrl(CachingToRawException):
+    message = _("Provided url is not RBD valid: %(url)s")
+
+
 class InvalidDataMigrationScript(GlanceException):
     message = _("Invalid data migration script '%(script)s'. A valid data "
                 "migration script must implement functions 'has_migrations' "
                 "and 'migrate'.")
+
+
+class ImageOperationNotPermitted(GlanceException):
+    message = _("The %(operation)s operation not permitted when "
+                "glance caching is configured")

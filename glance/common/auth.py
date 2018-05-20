@@ -116,7 +116,11 @@ class KeystoneStrategy(BaseStrategy):
             token_url = urlparse.urljoin(auth_url, "tokens")
             # 1. Check Keystone version
             is_v2 = auth_url.rstrip('/').endswith('v2.0')
-            if is_v2:
+            is_v3 = auth_url.rstrip('/').endswith('v3')
+            if is_v3:
+                token_url = urlparse.urljoin(auth_url, "auth/tokens")
+                self._v3_auth(token_url)
+            elif is_v2:
                 self._v2_auth(token_url)
             else:
                 self._v1_auth(token_url)
@@ -223,6 +227,45 @@ class KeystoneStrategy(BaseStrategy):
         elif resp.status == http.NOT_FOUND:
             raise exception.AuthUrlNotFound(url=token_url)
         else:
+            raise Exception(_('Unexpected response: %s') % resp.status)
+
+    def _v3_auth(self, token_url):
+        creds = self.creds
+
+        creds = {
+            "auth": {
+                "identity": {
+                    "methods": ["password"],
+                    "password": {
+                        "user": {
+                            "name": creds['username'],
+                            "domain": {"id": "default"},
+                            "password": creds['password']
+                        }
+                    }
+                }
+            }
+        }
+
+        headers = {'Content-Type': 'application/json'}
+        req_body = jsonutils.dumps(creds)
+
+        resp, resp_body = self._do_request(
+            token_url, 'POST', headers=headers, body=req_body)
+
+        if resp.status == 201:
+            resp_auth = resp['x-subject-token']
+            creds_region = self.creds.get('region')
+            if self.configure_via_auth:
+                endpoint = get_endpoint(resp_auth['serviceCatalog'],
+                                        endpoint_region=creds_region)
+                self.management_url = endpoint
+            self.auth_token = resp_auth
+        elif resp.status == 305:
+            raise exception.RedirectException(resp['location'])
+        elif resp.status == 400:
+            raise exception.AuthBadRequest(url=token_url)
+        elif resp.status == 401:
             raise Exception(_('Unexpected response: %s') % resp.status)
 
     @property

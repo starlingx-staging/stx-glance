@@ -487,7 +487,7 @@ class TestImageDataDeserializer(test_utils.BaseTestCase):
         output = self.deserializer.upload(request)
         data = output.pop('data')
         self.assertEqual('YYY', data.read())
-        expected = {'size': None}
+        expected = {'size': 0}
         self.assertEqual(expected, output)
 
     def test_upload_chunked_with_content_length(self):

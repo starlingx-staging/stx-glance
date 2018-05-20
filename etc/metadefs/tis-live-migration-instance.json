@@ -1,0 +1,36 @@
+{
+    "display_name": "WRS Live Migration Properties",
+    "namespace": "TiS::Compute::LiveMigrationInstance",
+    "description": "When booting an instance, you may specify its Nova Live Migration properties.",
+    "visibility": "public",
+    "protected": true,
+    "resource_type_associations" : [
+        {
+            "name": "OS::Nova::Server",
+            "properties_target": "metadata"
+        }
+    ],
+    "properties": {
+        "hw:wrs:live_migration_timeout": {
+            "title": "Live Migration Timeout",
+            "type": "string",
+            "pattern": "^0$|^(1[2-9][0-9]|[2-7]\\d\\d)$|^800$",
+            "default": "180",
+            "description": "The maximum time allowed for live migration. Set to 0 to disable timeout. If unspecified this value defaults to 180 seconds. The value should be in range [120, 800] or 0."
+        },
+        "hw:wrs:live_migration_max_downtime": {
+            "title": "Live Migration Max Downtime",
+            "type": "integer",
+            "minimum": 100,
+            "default": 500,
+            "description": "The maximum downtime allowed for live migration in milliseconds. If unspecified, this value defaults to 500ms. Minimum value is 100ms."
+        },
+        "sw:wrs:auto_recovery": {
+            "title": "Instance Auto Recovery",
+            "type": "boolean",
+            "default": "True",
+            "description": "Determines if the system will automatically recover failed virtual machine instances."
+        }
+    },
+    "objects": []
+}

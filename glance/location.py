@@ -31,7 +31,14 @@ import glance.domain.proxy
 from glance.i18n import _, _LE, _LI, _LW
 
 
+glance_remote_registry_opts = [
+    cfg.StrOpt('remote_registry_region_name',
+               default=None,
+               help="Region of the primary cloud/region"),
+]
+
 CONF = cfg.CONF
+CONF.register_opts(glance_remote_registry_opts)
 LOG = logging.getLogger(__name__)
 
 
@@ -146,6 +153,9 @@ class ImageFactoryProxy(glance.domain.proxy.ImageFactory):
                                                 proxy_kwargs=proxy_kwargs)
 
     def new_image(self, **kwargs):
+        # If glance cache is enabled, we don't allow users to create images
+        if CONF.remote_registry_region_name:
+            raise exception.ImageOperationNotPermitted(operation='create')
         locations = kwargs.get('locations', [])
         for loc in locations:
             _check_image_location(self.context,
@@ -397,6 +407,9 @@ class ImageProxy(glance.domain.proxy.Image):
             member_repo_proxy_kwargs=proxy_kwargs)
 
     def delete(self):
+        # If glance cache is enabled, we don't allow users to delete images
+        if CONF.remote_registry_region_name:
+            raise exception.ImageOperationNotPermitted(operation='delete')
         self.image.delete()
         if self.image.locations:
             for location in self.image.locations:
@@ -464,6 +477,26 @@ class ImageProxy(glance.domain.proxy.Image):
             # add a msg as usual.
             raise store.NotFound(image=None)
         err = None
+
+        # If glance cache is enabled, we overwrite the location
+        # to a remote glance one.
+        if CONF.remote_registry_region_name:
+            try:
+                data, size = self.store_api.get_from_backend(
+                    "glance://%s/%s" % (CONF.remote_registry_region_name,
+                                        self.image.image_id),
+                    offset=offset,
+                    chunk_size=chunk_size,
+                    context=self.context)
+
+                return data
+            except Exception as e:
+                LOG.warn(_LW('Get image %(id)s from remote glance server '
+                             'failed: %(err)s.')
+                         % {'id': self.image.image_id,
+                            'err': encodeutils.exception_to_unicode(e)})
+                err = e
+
         for loc in self.image.locations:
             try:
                 data, size = self.store_api.get_from_backend(

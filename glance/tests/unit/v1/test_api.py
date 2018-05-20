@@ -33,6 +33,7 @@ import webob
 
 import glance.api
 import glance.api.common
+from glance.api.v1 import images
 from glance.api.v1 import router
 from glance.api.v1 import upload_utils
 import glance.common.config
@@ -43,6 +44,8 @@ from glance.db.sqlalchemy import api as db_api
 from glance.db.sqlalchemy import models as db_models
 import glance.registry.client.v1.api as registry
 from glance.tests.unit import base
+from glance.tests.unit import fake_cache_raw
+from glance.tests.unit import fake_rados
 import glance.tests.unit.utils as unit_test_utils
 from glance.tests import utils as test_utils
 
@@ -1539,8 +1542,11 @@ class TestGlanceAPI(base.IsolatedUnitTest):
         res = req.get_response(self.api)
         self.assertEqual(http_client.FORBIDDEN, res.status_int)
 
-    def test_update_deleted_image(self):
+    @mock.patch.object(images, 'cache_raw')
+    def test_update_deleted_image(self, mock_cache_raw):
         """Tests that exception raised trying to update a deleted image"""
+        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
+
         req = webob.Request.blank("/images/%s" % UUID2)
         req.method = 'DELETE'
         res = req.get_response(self.api)
@@ -1556,8 +1562,11 @@ class TestGlanceAPI(base.IsolatedUnitTest):
         self.assertEqual(http_client.FORBIDDEN, res.status_int)
         self.assertIn(b'Forbidden to update deleted image', res.body)
 
-    def test_delete_deleted_image(self):
+    @mock.patch.object(images, 'cache_raw')
+    def test_delete_deleted_image(self, mock_cache_raw):
         """Tests that exception raised trying to delete a deleted image"""
+        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
+
         req = webob.Request.blank("/images/%s" % UUID2)
         req.method = 'DELETE'
         res = req.get_response(self.api)
@@ -1584,10 +1593,12 @@ class TestGlanceAPI(base.IsolatedUnitTest):
         self.assertEqual(http_client.OK, res.status_int)
         self.assertEqual("deleted", res.headers['x-image-meta-status'])
 
-    def test_image_status_when_delete_fails(self):
+    @mock.patch.object(images, 'cache_raw')
+    def test_image_status_when_delete_fails(self, mock_cache_raw):
         """
         Tests that the image status set to active if deletion of image fails.
         """
+        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
 
         fs = store.get_store_from_scheme('file')
 
@@ -1929,14 +1940,17 @@ class TestGlanceAPI(base.IsolatedUnitTest):
         # We expect 500 since an exception occurred during upload.
         self.assertEqual(http_client.INTERNAL_SERVER_ERROR, res.status_int)
 
+    @mock.patch.object(upload_utils, 'rbd')
     @mock.patch('glance_store.store_add_to_backend')
-    def test_upload_safe_kill(self, mock_store_add_to_backend):
+    def test_upload_safe_kill(self, mock_store_add_to_backend, mock_rbd):
 
         def mock_store_add_to_backend_w_exception(*args, **kwargs):
             """Trigger mid-upload failure by raising an exception."""
             self.image_status.append(self._get_image_status(self.image_id))
             # Raise an exception to emulate failed upload.
             raise Exception("== UNIT TEST UPLOAD EXCEPTION ==")
+
+        mock_rbd.NoSpace = fake_rados.mock_rbd.NoSpace
 
         mocks = [{'mock': mock_store_add_to_backend,
                  'side_effect': mock_store_add_to_backend_w_exception}]
@@ -1949,8 +1963,11 @@ class TestGlanceAPI(base.IsolatedUnitTest):
 
         self.assertEqual(1, mock_store_add_to_backend.call_count)
 
+    @mock.patch.object(images, 'cache_raw')
+    @mock.patch.object(upload_utils, 'rbd')
     @mock.patch('glance_store.store_add_to_backend')
-    def test_upload_safe_kill_deleted(self, mock_store_add_to_backend):
+    def test_upload_safe_kill_deleted(self, mock_store_add_to_backend,
+                                      mock_rbd, mock_cache_raw):
         test_router_api = router.API(self.mapper)
         self.api = test_utils.FakeAuthMiddleware(test_router_api,
                                                  is_admin=True)
@@ -1974,6 +1991,9 @@ class TestGlanceAPI(base.IsolatedUnitTest):
 
             # Raise an exception to make the upload fail.
             raise Exception("== UNIT TEST UPLOAD EXCEPTION ==")
+
+        mock_rbd.NoSpace = fake_rados.mock_rbd.NoSpace
+        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
 
         mocks = [{'mock': mock_store_add_to_backend,
                  'side_effect': mock_store_add_to_backend_w_exception}]
@@ -2064,10 +2084,14 @@ class TestGlanceAPI(base.IsolatedUnitTest):
         self.assertEqual('True', res.headers['x-image-meta-deleted'])
         self.assertEqual('deleted', res.headers['x-image-meta-status'])
 
-    def test_delete_during_image_upload_by_normal_user(self):
+    @mock.patch.object(images, 'cache_raw')
+    def test_delete_during_image_upload_by_normal_user(self, mock_cache_raw):
+        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
         self._check_delete_during_image_upload(is_admin=False)
 
-    def test_delete_during_image_upload_by_admin(self):
+    @mock.patch.object(images, 'cache_raw')
+    def test_delete_during_image_upload_by_admin(self, mock_cache_raw):
+        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
         self._check_delete_during_image_upload(is_admin=True)
 
     def test_disable_purge_props(self):
@@ -2898,7 +2922,9 @@ class TestGlanceAPI(base.IsolatedUnitTest):
         res = req.get_response(self.api)
         self.assertEqual(http_client.BAD_REQUEST, res.status_int)
 
-    def test_delete_image(self):
+    @mock.patch.object(images, 'cache_raw')
+    def test_delete_image(self, mock_cache_raw):
+        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
         req = webob.Request.blank("/images/%s" % UUID2)
         req.method = 'DELETE'
         res = req.get_response(self.api)
@@ -2944,7 +2970,8 @@ class TestGlanceAPI(base.IsolatedUnitTest):
         self.assertEqual(http_client.OK, res.status_int)
         self.assertEqual(19, len(res.body))
 
-    def test_delete_queued_image(self):
+    @mock.patch.object(images, 'cache_raw')
+    def test_delete_queued_image(self, mock_cache_raw):
         """Delete an image in a queued state
 
         Bug #747799 demonstrated that trying to DELETE an image
@@ -2958,6 +2985,8 @@ class TestGlanceAPI(base.IsolatedUnitTest):
                            'x-image-meta-disk-format': 'vhd',
                            'x-image-meta-container-format': 'ovf',
                            'x-image-meta-name': 'fake image #3'}
+
+        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
 
         req = webob.Request.blank("/images")
         req.method = 'POST'
@@ -2982,7 +3011,8 @@ class TestGlanceAPI(base.IsolatedUnitTest):
         self.assertEqual('True', res.headers['x-image-meta-deleted'])
         self.assertEqual('deleted', res.headers['x-image-meta-status'])
 
-    def test_delete_queued_image_delayed_delete(self):
+    @mock.patch.object(images, 'cache_raw')
+    def test_delete_queued_image_delayed_delete(self, mock_cache_raw):
         """Delete an image in a queued state when delayed_delete is on
 
         Bug #1048851 demonstrated that the status was not properly
@@ -2993,6 +3023,8 @@ class TestGlanceAPI(base.IsolatedUnitTest):
                            'x-image-meta-disk-format': 'vhd',
                            'x-image-meta-container-format': 'ovf',
                            'x-image-meta-name': 'fake image #3'}
+
+        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
 
         req = webob.Request.blank("/images")
         req.method = 'POST'
@@ -3456,10 +3488,13 @@ class TestGlanceAPI(base.IsolatedUnitTest):
         res = req.get_response(self.api)
         self.assertEqual(webob.exc.HTTPNoContent.code, res.status_int)
 
-    def test_get_members_of_deleted_image_raises_404(self):
+    @mock.patch.object(images, 'cache_raw')
+    def test_get_members_of_deleted_image_raises_404(self, mock_cache_raw):
         """
         Tests members listing for deleted image raises 404.
         """
+        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
+
         req = webob.Request.blank("/images/%s" % UUID2)
         req.method = 'DELETE'
         res = req.get_response(self.api)
@@ -3473,10 +3508,13 @@ class TestGlanceAPI(base.IsolatedUnitTest):
         self.assertIn('Image with identifier %s has been deleted.' % UUID2,
                       res.body.decode())
 
-    def test_delete_member_of_deleted_image_raises_404(self):
+    @mock.patch.object(images, 'cache_raw')
+    def test_delete_member_of_deleted_image_raises_404(self, mock_cache_raw):
         """
         Tests deleting members of deleted image raises 404.
         """
+        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
+
         test_router = router.API(self.mapper)
         self.api = test_utils.FakeAuthMiddleware(test_router, is_admin=True)
         req = webob.Request.blank("/images/%s" % UUID2)
@@ -3492,10 +3530,13 @@ class TestGlanceAPI(base.IsolatedUnitTest):
         self.assertIn('Image with identifier %s has been deleted.' % UUID2,
                       res.body.decode())
 
-    def test_update_members_of_deleted_image_raises_404(self):
+    @mock.patch.object(images, 'cache_raw')
+    def test_update_members_of_deleted_image_raises_404(self, mock_cache_raw):
         """
         Tests update members of deleted image raises 404.
         """
+        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
+
         test_router = router.API(self.mapper)
         self.api = test_utils.FakeAuthMiddleware(test_router, is_admin=True)
 
@@ -3601,10 +3642,13 @@ class TestGlanceAPI(base.IsolatedUnitTest):
         memb_list = jsonutils.loads(res.body)['members']
         self.assertEqual(fixture, memb_list)
 
-    def test_create_member_to_deleted_image_raises_404(self):
+    @mock.patch.object(images, 'cache_raw')
+    def test_create_member_to_deleted_image_raises_404(self, mock_cache_raw):
         """
         Tests adding members to deleted image raises 404.
         """
+        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
+
         test_router = router.API(self.mapper)
         self.api = test_utils.FakeAuthMiddleware(test_router, is_admin=True)
         req = webob.Request.blank("/images/%s" % UUID2)
@@ -3911,7 +3955,7 @@ class TestImageSerializer(base.IsolatedUnitTest):
     def test_redact_location(self):
         """Ensure location redaction does not change original metadata"""
         image_meta = {'size': 3, 'id': '123', 'location': 'http://localhost'}
-        redacted_image_meta = {'size': 3, 'id': '123'}
+        redacted_image_meta = {'size': 3, 'id': '123', 'store': 'http'}
         copy_image_meta = copy.deepcopy(image_meta)
         tmp_image_meta = glance.api.v1.images.redact_loc(image_meta)
 

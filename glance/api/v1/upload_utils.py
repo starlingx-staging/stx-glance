@@ -26,6 +26,10 @@ import glance.db
 from glance.i18n import _, _LE, _LI
 import glance.registry.client.v1.api as registry
 
+try:
+    import rbd
+except ImportError:
+    rbd = None
 
 CONF = cfg.CONF
 LOG = logging.getLogger(__name__)
@@ -43,7 +47,7 @@ def initiate_deletion(req, location_data, id):
                                                    id, location_data)
 
 
-def _kill(req, image_id, from_state):
+def _kill(req, image_id, from_state, reason=None):
     """
     Marks the image status to `killed`.
 
@@ -55,11 +59,13 @@ def _kill(req, image_id, from_state):
     # needs updating to reflect the fact that queued->killed and saving->killed
     # are both allowed.
     registry.update_image_metadata(req.context, image_id,
-                                   {'status': 'killed'},
+                                   {'status': 'killed',
+                                    'properties': {'kill_reason': reason}
+                                    if reason else {}},
                                    from_state=from_state)
 
 
-def safe_kill(req, image_id, from_state):
+def safe_kill(req, image_id, from_state, reason=None):
     """
     Mark image killed without raising exceptions if it fails.
 
@@ -71,7 +77,7 @@ def safe_kill(req, image_id, from_state):
     :param from_state: Permitted current status for transition to 'killed'
     """
     try:
-        _kill(req, image_id, from_state)
+        _kill(req, image_id, from_state, reason)
     except Exception:
         LOG.exception(_LE("Unable to kill image %(id)s: ") % {'id': image_id})
 
@@ -135,7 +141,7 @@ def upload_data_to_store(req, image_meta, image_data, store, notifier):
                                                    'supplied': supplied,
                                                    'actual': actual})
                 LOG.error(msg)
-                safe_kill(req, image_id, 'saving')
+                safe_kill(req, image_id, 'saving', msg)
                 initiate_deletion(req, location_data, image_id)
                 raise webob.exc.HTTPBadRequest(explanation=msg,
                                                content_type="text/plain",
@@ -195,7 +201,7 @@ def upload_data_to_store(req, image_meta, image_data, store, notifier):
         msg = _("Error in store configuration. Adding images to store "
                 "is disabled.")
         LOG.exception(msg)
-        safe_kill(req, image_id, 'saving')
+        safe_kill(req, image_id, 'saving', msg)
         notifier.error('image.upload', msg)
         raise webob.exc.HTTPGone(explanation=msg, request=req,
                                  content_type='text/plain')
@@ -216,7 +222,7 @@ def upload_data_to_store(req, image_meta, image_data, store, notifier):
         msg = (_("Forbidden upload attempt: %s") %
                encodeutils.exception_to_unicode(e))
         LOG.warn(msg)
-        safe_kill(req, image_id, 'saving')
+        safe_kill(req, image_id, 'saving', msg)
         notifier.error('image.upload', msg)
         raise webob.exc.HTTPForbidden(explanation=msg,
                                       request=req,
@@ -226,7 +232,7 @@ def upload_data_to_store(req, image_meta, image_data, store, notifier):
         msg = (_("Image storage media is full: %s") %
                encodeutils.exception_to_unicode(e))
         LOG.error(msg)
-        safe_kill(req, image_id, 'saving')
+        safe_kill(req, image_id, 'saving', msg)
         notifier.error('image.upload', msg)
         raise webob.exc.HTTPRequestEntityTooLarge(explanation=msg,
                                                   request=req,
@@ -236,7 +242,7 @@ def upload_data_to_store(req, image_meta, image_data, store, notifier):
         msg = (_("Insufficient permissions on image storage media: %s") %
                encodeutils.exception_to_unicode(e))
         LOG.error(msg)
-        safe_kill(req, image_id, 'saving')
+        safe_kill(req, image_id, 'saving', msg)
         notifier.error('image.upload', msg)
         raise webob.exc.HTTPServiceUnavailable(explanation=msg,
                                                request=req,
@@ -246,7 +252,7 @@ def upload_data_to_store(req, image_meta, image_data, store, notifier):
         msg = (_("Denying attempt to upload image larger than %d bytes.")
                % CONF.image_size_cap)
         LOG.warn(msg)
-        safe_kill(req, image_id, 'saving')
+        safe_kill(req, image_id, 'saving', msg)
         notifier.error('image.upload', msg)
         raise webob.exc.HTTPRequestEntityTooLarge(explanation=msg,
                                                   request=req,
@@ -256,7 +262,7 @@ def upload_data_to_store(req, image_meta, image_data, store, notifier):
         msg = (_("Denying attempt to upload image because it exceeds the "
                  "quota: %s") % encodeutils.exception_to_unicode(e))
         LOG.warn(msg)
-        safe_kill(req, image_id, 'saving')
+        safe_kill(req, image_id, 'saving', msg)
         notifier.error('image.upload', msg)
         raise webob.exc.HTTPRequestEntityTooLarge(explanation=msg,
                                                   request=req,
@@ -271,20 +277,29 @@ def upload_data_to_store(req, image_meta, image_data, store, notifier):
         notifier.error('image.upload', msg)
         with excutils.save_and_reraise_exception():
             LOG.exception(msg)
-            safe_kill(req, image_id, 'saving')
+            safe_kill(req, image_id, 'saving', msg)
 
     except (ValueError, IOError) as e:
         msg = _("Client disconnected before sending all data to backend")
         LOG.warn(msg)
-        safe_kill(req, image_id, 'saving')
+        safe_kill(req, image_id, 'saving', msg)
         raise webob.exc.HTTPBadRequest(explanation=msg,
                                        content_type="text/plain",
                                        request=req)
+    except rbd.NoSpace as e:
+        msg = _LE("Error creating image: insufficient space available")
+        LOG.error(msg)
+        safe_kill(req, image_id, 'saving')
+        notifier.error('image.upload', msg)
+        raise webob.exc.HTTPRequestEntityTooLarge(explanation=msg,
+                                                  request=req,
+                                                  content_type='text/plain')
 
     except Exception as e:
-        msg = _("Failed to upload image %s") % image_id
+        msg = (_("Failed to upload image %(id)s. Error type: %(error)s") %
+               {'id': image_id, 'error': type(e).__name__})
         LOG.exception(msg)
-        safe_kill(req, image_id, 'saving')
+        safe_kill(req, image_id, 'saving', msg)
         notifier.error('image.upload', msg)
         raise webob.exc.HTTPInternalServerError(explanation=msg,
                                                 request=req,

@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2015 Wind River Systems, Inc.
+#
 
 """
 /images endpoint for Glance v1 API
@@ -43,6 +46,7 @@ import glance.api.v1
 from glance.api.v1 import controller
 from glance.api.v1 import filters
 from glance.api.v1 import upload_utils
+from glance import cache_raw
 from glance.common import exception
 from glance.common import property_utils
 from glance.common import store_utils
@@ -140,7 +144,71 @@ def validate_image_meta(req, values):
                checksum)
         raise HTTPBadRequest(explanation=msg, request=req)
 
+    validate_image_properties(req, values)
+
     return values
+
+
+def validate_image_properties(req, values):
+
+    properties = values.get('properties')
+    msg = ''
+
+    if not properties:
+        return
+
+    """
+    validate hw_wrs_live_migration_max_downtime property
+    """
+    prop_value = properties.get('hw_wrs_live_migration_max_downtime')
+    if prop_value:
+        LOG.info(_LI('hw_wrs_live_migration_max_downtime: %s') % prop_value)
+        try:
+            prop_value = int(prop_value)
+        except ValueError:
+            msg = _('hw_wrs_live_migration_max_downtime must be a number'
+                    ' greater than or equal to 100, value: %s') % prop_value
+            raise HTTPBadRequest(explanation=msg, request=req)
+
+        if prop_value < 100:
+            msg = _('hw_wrs_live_migration_max_downtime must be a number'
+                    ' greater than or equal to 100, value: %s') % prop_value
+            raise HTTPBadRequest(explanation=msg, request=req)
+
+    """
+    validate hw_wrs_live_migration_timeout property
+    """
+    prop_value = properties.get('hw_wrs_live_migration_timeout')
+    if prop_value:
+        LOG.info(_LI('hw_wrs_live_migration_timeout: %s') % prop_value)
+        try:
+            prop_value = int(prop_value)
+        except ValueError:
+            msg = _('hw_wrs_live_migration_timeout must be a number '
+                    'between 120 and 800 or 0, value: %s') % prop_value
+            raise HTTPBadRequest(explanation=msg, request=req)
+
+        if prop_value != 0:
+            if prop_value < 120 or prop_value > 800:
+                msg = _('hw_wrs_live_migration_timeout must be a number '
+                        'between 120 and 800 or 0, value: %s') % prop_value
+                raise HTTPBadRequest(explanation=msg, request=req)
+
+    """
+    validate sw_wrs_auto_recovery property
+    """
+    prop_value = properties.get('sw_wrs_auto_recovery')
+    if prop_value:
+        LOG.info(_LI('sw_wrs_auto_recovery: %s') % prop_value)
+        auto_recovery = prop_value.lower()
+        if 'false' == auto_recovery:
+            values['properties']['sw_wrs_auto_recovery'] = 'False'
+        elif 'true' == auto_recovery:
+            values['properties']['sw_wrs_auto_recovery'] = 'True'
+        else:
+            msg = _('sw_wrs_auto_recovery must be True or False, '
+                    'value: %s') % prop_value
+            raise HTTPBadRequest(explanation=msg, request=req)
 
 
 def redact_loc(image_meta, copy_dict=True):
@@ -152,6 +220,9 @@ def redact_loc(image_meta, copy_dict=True):
         new_image_meta = copy.copy(image_meta)
     else:
         new_image_meta = image_meta
+    # store information is useful in a dual glance backend system
+    if new_image_meta and new_image_meta.get('location', None):
+        new_image_meta['store'] = new_image_meta['location'].split(':')[0]
     new_image_meta.pop('location', None)
     new_image_meta.pop('location_data', None)
     return new_image_meta
@@ -716,6 +787,7 @@ class Controller(controller.BaseController):
                                                              from_state=s)
             self.notifier.info("image.activate", redact_loc(image_meta_data))
             self.notifier.info("image.update", redact_loc(image_meta_data))
+            cache_raw.create_image_cache(req.context, image_id)
             return image_meta_data
         except exception.Duplicate:
             with excutils.save_and_reraise_exception():
@@ -1142,6 +1214,19 @@ class Controller(controller.BaseController):
         if image['location'] and CONF.delayed_delete:
             status = 'pending_delete'
         else:
+            try:
+                cache_raw.delete_image_cache(req.context, id, image)
+            except Exception as ex:
+                msg = ("Failed to delete cache for %s image. "
+                       "Reason: %s" % (id, unicode(ex)))
+                import sys
+                import traceback
+                exc_type, exc_value, exc_traceback = sys.exc_info()
+                trace = traceback.format_tb(exc_traceback, limit=10) + [msg]
+                LOG.error(trace)
+                raise HTTPForbidden(explanation=msg,
+                                    request=req,
+                                    content_type="text/plain")
             status = 'deleted'
 
         ori_status = image['status']
@@ -1152,6 +1237,7 @@ class Controller(controller.BaseController):
             # See https://bugs.launchpad.net/glance/+bug/1065187
             image = registry.update_image_metadata(req.context, id,
                                                    {'status': status})
+            kill_reason = image.get('properties', {}).get('kill_reason')
 
             try:
                 # The image's location field may be None in the case
@@ -1168,6 +1254,10 @@ class Controller(controller.BaseController):
                                                    {'status': ori_status})
 
             registry.delete_image_metadata(req.context, id)
+            if kill_reason is not None:
+                image = registry.update_image_metadata(
+                    req.context, id,
+                    {'properties': {'kill_reason': kill_reason}})
         except exception.ImageNotFound as e:
             msg = (_("Failed to find image to delete: %s") %
                    encodeutils.exception_to_unicode(e))

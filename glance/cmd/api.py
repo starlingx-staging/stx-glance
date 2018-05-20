@@ -45,6 +45,7 @@ from oslo_config import cfg
 from oslo_log import log as logging
 import osprofiler.initializer
 
+from glance import cache_raw
 from glance.common import config
 from glance.common import exception
 from glance.common import wsgi
@@ -75,6 +76,11 @@ def main():
         logging.setup(CONF, 'glance')
         notifier.set_defaults()
 
+        # Shared data need to be initialized prior to fork()
+        # so we need this before WSGI initialization in case it is
+        # configured to use it
+        cache_raw.initialize()
+
         if CONF.profiler.enabled:
             osprofiler.initializer.init_from_conf(
                 conf=CONF,
@@ -86,7 +92,10 @@ def main():
 
         server = wsgi.Server(initialize_glance_store=True)
         server.start(config.load_paste_app('glance-api'), default_port=9292)
-        server.wait()
+        # Start RAW caching
+        p = cache_raw.start_raw_caching(server)
+        server.wait(p)
+
     except KNOWN_EXCEPTIONS as e:
         fail(e)
 

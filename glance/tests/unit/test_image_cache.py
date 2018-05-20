@@ -16,6 +16,7 @@
 from contextlib import contextmanager
 import datetime
 import hashlib
+import mock
 import os
 import time
 
@@ -168,10 +169,15 @@ class ImageCacheTestCase(object):
         self.assertTrue(os.path.exists(incomplete_file_path_2))
 
     @skip_if_disabled
-    def test_prune(self):
+    @mock.patch.object(glance.image_cache.ImageCache,
+                       'get_orphaned_cached_images')
+    def test_prune(self,
+                   mock_cache_get_orphaned_images):
         """
         Test that pruning the cache works as expected...
         """
+
+        mock_cache_get_orphaned_images.return_values = None
         self.assertEqual(0, self.cache.get_cache_size())
 
         # Add a bunch of images to the cache. The max cache size for the cache
@@ -216,11 +222,15 @@ class ImageCacheTestCase(object):
         self.assertTrue(self.cache.is_cached(99), "Image 99 was not cached!")
 
     @skip_if_disabled
-    def test_prune_to_zero(self):
+    @mock.patch.object(glance.image_cache.ImageCache,
+                       'get_orphaned_cached_images')
+    def test_prune_to_zero(self,
+                           mock_cache_get_orphaned_images):
         """Test that an image_cache_max_size of 0 doesn't kill the pruner
 
         This is a test specifically for LP #1039854
         """
+        mock_cache_get_orphaned_images.return_value = None
         self.assertEqual(0, self.cache.get_cache_size())
 
         FIXTURE_FILE = six.BytesIO(FIXTURE_DATA)

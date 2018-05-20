@@ -1956,18 +1956,21 @@ class DBPurgeTests(test_utils.BaseTestCase):
         dt3 = dt2 + datetime.timedelta(days=1)
         fixtures = [
             {
+                'id': '1',
                 'created_at': dt1,
                 'updated_at': dt1,
                 'deleted_at': dt3,
                 'deleted': True,
             },
             {
+                'id': '2',
                 'created_at': dt1,
                 'updated_at': dt2,
                 'deleted_at': timeutils.utcnow(),
                 'deleted': True,
             },
             {
+                'id': '3',
                 'created_at': dt2,
                 'updated_at': dt2,
                 'deleted_at': None,
@@ -2062,6 +2065,55 @@ class DBPurgeTests(test_utils.BaseTestCase):
         # due to DBReferenceError being raised
         images_rows = session.query(images).count()
         self.assertEqual(4, images_rows)
+
+
+class WRSDBPurgeTests(test_utils.BaseTestCase):
+
+    def setUp(self):
+        super(WRSDBPurgeTests, self).setUp()
+        self.adm_context = context.get_admin_context(show_deleted=True)
+        self.db_api = db_tests.get_db(self.config)
+        db_tests.reset_db(self.db_api)
+        self.tenant_id = str(uuid.uuid4())
+        self.context = context.RequestContext(
+            tenant=self.tenant_id,
+            is_admin=True)
+        past = timeutils.utcnow() - datetime.timedelta(days=5)
+        self.db_api.task_create(
+            self.context,
+            build_task_fixture(
+                id='1',
+                created_at=past,
+                udpated_at=past + datetime.timedelta(days=1),
+                expires_at=past + datetime.timedelta(days=2),
+                deleted=False,
+                owner=self.tenant_id))
+
+    def test_purge_task_info_with_refs_to_soft_deleted_tasks(self):
+        session = db_api.get_session()
+        engine = db_api.get_engine()
+
+        # pretend we soft deleted fixture 2 days ago
+        with mock.patch.object(timeutils, 'utcnow') as mock_utcnow:
+            mock_utcnow.return_value = (
+                datetime.datetime.utcnow()
+                - datetime.timedelta(days=2))
+            tasks = self.db_api.task_get_all(self.context)
+            self.assertEqual(1, len(tasks))
+            self.assertTrue(tasks[0]['deleted'])
+
+        # and purge soft deleted rows older than yesterday
+        self.db_api.purge_deleted_rows(self.context, 1, 5)
+
+        # check fixture task is purged
+        tasks = self.db_api.task_get_all(self.adm_context)
+        self.assertEqual(0, len(tasks))
+
+        # and no task_info was left behind
+        task_info = sqlalchemyutils.get_table(
+            engine, 'task_info')
+        task_info_rows = session.query(task_info).count()
+        self.assertEqual(0, task_info_rows)
 
 
 class TestVisibility(test_utils.BaseTestCase):

@@ -61,6 +61,9 @@ class mock_rbd(object):
     class ImageNotFound(Exception):
         pass
 
+    class NoSpace(Exception):
+        pass
+
     class Image(object):
 
         def __init__(self, *args, **kwargs):

@@ -30,6 +30,15 @@ from glance.common import timeutils
 from glance.domain import proxy as domain_proxy
 from glance.i18n import _, _LE
 
+# Import Fault Manager API
+try:
+    from fm_api import constants as fm_const
+    from fm_api import fm_api
+except ImportError:
+    import mock
+    fm_const = mock.Mock()
+    fm_api = mock.Mock()
+
 
 notifier_opts = [
     cfg.StrOpt('default_publisher_id',
@@ -133,6 +142,25 @@ def _is_notification_enabled(notification):
 def _send_notification(notify, notification_type, payload):
     if _is_notification_enabled(notification_type):
         notify(notification_type, payload)
+
+
+def _raise_fm_fault(image_id, msg):
+    """
+    Raise fault with message 'msg' using FM API
+    """
+    entity_instance_id = str(image_id)
+
+    fm_api.FaultAPIs().set_fault(fm_api.Fault(
+        alarm_id=fm_const.FM_ALARM_ID_STORAGE_IMAGE,
+        alarm_state=fm_const.FM_ALARM_STATE_MSG,
+        entity_type_id=fm_const.FM_ENTITY_TYPE_SERVICE,
+        entity_instance_id=entity_instance_id,
+        severity=fm_const.FM_ALARM_SEVERITY_WARNING,
+        reason_text=msg,
+        alarm_type=fm_const.FM_ALARM_TYPE_4,
+        probable_cause=fm_const.ALARM_PROBABLE_CAUSE_UNKNOWN,
+        proposed_repair_action='Contact next level of support',
+        service_affecting=False))
 
 
 def format_image_notification(image):
@@ -428,17 +456,20 @@ class ImageProxy(NotificationProxy, domain_proxy.Image):
         except glance_store.StorageFull as e:
             msg = (_("Image storage media is full: %s") %
                    encodeutils.exception_to_unicode(e))
+            _raise_fm_fault(self.repo.image_id, str(msg))
             _send_notification(notify_error, 'image.upload', msg)
             raise webob.exc.HTTPRequestEntityTooLarge(explanation=msg)
         except glance_store.StorageWriteDenied as e:
             msg = (_("Insufficient permissions on image storage media: %s")
                    % encodeutils.exception_to_unicode(e))
+            _raise_fm_fault(self.repo.image_id, str(msg))
             _send_notification(notify_error, 'image.upload', msg)
             raise webob.exc.HTTPServiceUnavailable(explanation=msg)
         except ValueError as e:
             msg = (_("Cannot save data for image %(image_id)s: %(error)s") %
                    {'image_id': self.repo.image_id,
                     'error': encodeutils.exception_to_unicode(e)})
+            _raise_fm_fault(self.repo.image_id, str(msg))
             _send_notification(notify_error, 'image.upload', msg)
             raise webob.exc.HTTPBadRequest(
                 explanation=encodeutils.exception_to_unicode(e))
@@ -447,6 +478,7 @@ class ImageProxy(NotificationProxy, domain_proxy.Image):
                      "%(image_id)s: %(error)s") %
                    {'image_id': self.repo.image_id,
                     'error': encodeutils.exception_to_unicode(e)})
+            _raise_fm_fault(self.repo.image_id, str(msg))
             _send_notification(notify_error, 'image.upload', msg)
             raise webob.exc.HTTPConflict(explanation=msg)
         except exception.Forbidden as e:
@@ -454,6 +486,7 @@ class ImageProxy(NotificationProxy, domain_proxy.Image):
                      " %(error)s")
                    % {'image_id': self.repo.image_id,
                       'error': encodeutils.exception_to_unicode(e)})
+            _raise_fm_fault(self.repo.image_id, str(msg))
             _send_notification(notify_error, 'image.upload', msg)
             raise webob.exc.HTTPForbidden(explanation=msg)
         except exception.NotFound as e:
@@ -462,6 +495,7 @@ class ImageProxy(NotificationProxy, domain_proxy.Image):
                      " The image may have been deleted during the upload:"
                      " %(error)s") % {'image_id': self.repo.image_id,
                                       'error': exc_str})
+            _raise_fm_fault(self.repo.image_id, str(msg))
             _send_notification(notify_error, 'image.upload', msg)
             raise webob.exc.HTTPNotFound(explanation=exc_str)
         except webob.exc.HTTPError as e:
@@ -470,6 +504,7 @@ class ImageProxy(NotificationProxy, domain_proxy.Image):
                          " due to HTTP error: %(error)s") %
                        {'image_id': self.repo.image_id,
                         'error': encodeutils.exception_to_unicode(e)})
+                _raise_fm_fault(self.repo.image_id, str(msg))
                 _send_notification(notify_error, 'image.upload', msg)
         except Exception as e:
             with excutils.save_and_reraise_exception():
@@ -477,6 +512,7 @@ class ImageProxy(NotificationProxy, domain_proxy.Image):
                          "due to internal error: %(error)s") %
                        {'image_id': self.repo.image_id,
                         'error': encodeutils.exception_to_unicode(e)})
+                _raise_fm_fault(self.repo.image_id, str(msg))
                 _send_notification(notify_error, 'image.upload', msg)
         else:
             self.send_notification('image.upload', self.repo)

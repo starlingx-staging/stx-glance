@@ -24,6 +24,13 @@ from oslo_utils import strutils
 from oslo_utils import uuidutils
 from webob import exc
 
+try:
+    from fm_api import constants as fm_const
+    from fm_api import fm_api
+except ImportError:
+    import mock
+    fm_const = mock.Mock()
+    fm_api = mock.Mock()
 from glance.common import exception
 from glance.common import timeutils
 from glance.common import utils
@@ -497,7 +504,32 @@ class Controller(object):
                                                      purge_props=purge_props,
                                                      from_state=from_state,
                                                      v1_mode=True)
-
+            if image_data.get('status') == 'killed':
+                kill_reason = image_data.get('properties', {}) \
+                                        .get('kill_reason')
+                if kill_reason:
+                    entity_instance_id = 'image=%(id)s' % {'id': id}
+                    try:
+                        image = make_image_dict(
+                            self.db_api.image_get(req.context, id))
+                        instance_id = image.get('properties', {}) \
+                                           .get('instance_uuid')
+                        if instance_id:
+                            entity_instance_id += ', instance=%(id)s' % {
+                                'id': instance_id}
+                    except Exception:
+                        pass
+                    fm_api.FaultAPIs().set_fault(fm_api.Fault(
+                        alarm_id=fm_const.FM_ALARM_ID_STORAGE_IMAGE,
+                        alarm_state=fm_const.FM_ALARM_STATE_MSG,
+                        entity_type_id=fm_const.FM_ENTITY_TYPE_SERVICE,
+                        entity_instance_id=entity_instance_id,
+                        severity=fm_const.FM_ALARM_SEVERITY_WARNING,
+                        reason_text=kill_reason,
+                        alarm_type=fm_const.FM_ALARM_TYPE_4,
+                        probable_cause=fm_const.ALARM_PROBABLE_CAUSE_UNKNOWN,
+                        proposed_repair_action='Contact next level of support',
+                        service_affecting=False))
             LOG.info(_LI("Updating metadata for image %(id)s"), {'id': id})
             return dict(image=make_image_dict(updated_image))
         except exception.Invalid as e:

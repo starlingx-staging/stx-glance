@@ -15,13 +15,17 @@ import hashlib
 import os
 import tempfile
 
+import mock
+
 from oslo_serialization import jsonutils
 from oslo_utils import units
 from six.moves import http_client
 import testtools
 
+from glance.api.v1 import images
 from glance.common import timeutils
 from glance.tests.integration.legacy_functional import base
+from glance.tests.unit import fake_cache_raw
 from glance.tests.utils import minimal_headers
 
 FIVE_KB = 5 * units.Ki
@@ -29,7 +33,10 @@ FIVE_GB = 5 * units.Gi
 
 
 class TestApi(base.ApiTest):
-    def test_get_head_simple_post(self):
+    @mock.patch.object(images, 'cache_raw')
+    def test_get_head_simple_post(self, mock_cache_raw):
+        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
+
         # 0. GET /images
         # Verify no public images
         path = "/v1/images"
@@ -220,7 +227,8 @@ class TestApi(base.ApiTest):
         response, content = self.http.request(path, 'DELETE')
         self.assertEqual(http_client.OK, response.status)
 
-    def test_queued_process_flow(self):
+    @mock.patch.object(images, 'cache_raw')
+    def test_queued_process_flow(self, mock_cache_raw):
         """
         We test the process flow where a user registers an image
         with Glance but does not immediately upload an image file.
@@ -243,6 +251,7 @@ class TestApi(base.ApiTest):
         6. GET /images
         - Verify one public image
         """
+        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
 
         # 0. GET /images
         # Verify no public images
@@ -729,10 +738,12 @@ class TestApi(base.ApiTest):
         self.assertEqual(http_client.BAD_REQUEST, response.status)
         self.assertIn("is_public got imalittleteapot", content)
 
-    def test_limited_images(self):
+    @mock.patch.object(images, 'cache_raw')
+    def test_limited_images(self, mock_cache_raw):
         """
         Ensure marker and limit query params work
         """
+        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
 
         # 0. GET /images
         # Verify no public images
@@ -817,10 +828,13 @@ class TestApi(base.ApiTest):
             response, content = self.http.request(path, 'DELETE')
             self.assertEqual(http_client.OK, response.status)
 
-    def test_ordered_images(self):
+    @mock.patch.object(images, 'cache_raw')
+    def test_ordered_images(self, mock_cache_raw):
         """
         Set up three test images and ensure each query param filter works
         """
+        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
+
         # 0. GET /images
         # Verify no public images
         path = "/v1/images"
@@ -1300,7 +1314,10 @@ class TestApiWithFakeAuth(base.ApiTest):
         for image in images:
             self.assertFalse(image['is_public'])
 
-    def test_property_protections(self):
+    @mock.patch.object(images, 'cache_raw')
+    def test_property_protections(self, mock_cache_raw):
+        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
+
         # Enable property protection
         self.config(property_protection_file=self.property_file)
         self.init()

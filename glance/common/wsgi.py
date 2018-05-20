@@ -24,6 +24,7 @@ from __future__ import print_function
 import errno
 import functools
 import os
+import psutil
 import signal
 import sys
 import time
@@ -308,6 +309,10 @@ wsgi_opts = [
                       '"HTTP_X_FORWARDED_PROTO".')),
 ]
 
+wrs_options = [
+    cfg.BoolOpt("graceful_shutdown", default=False,
+                help=_('Enable graceful shutdown through SIGUSR1.')),
+]
 
 LOG = logging.getLogger(__name__)
 
@@ -316,6 +321,7 @@ CONF.register_opts(bind_opts)
 CONF.register_opts(socket_opts)
 CONF.register_opts(eventlet_opts)
 CONF.register_opts(wsgi_opts)
+CONF.register_opts(wrs_options)
 profiler_opts.set_defaults(CONF)
 
 ASYNC_EVENTLET_THREAD_POOL_LIST = []
@@ -460,6 +466,8 @@ class Server(object):
         self.children = set()
         self.stale_children = set()
         self.running = True
+        self._exit = False  # WRS: Implement graceful process exit
+        self.raw_caching_pid = None  # WRS: WSGI thinks it's alone
         # NOTE(abhishek): Allows us to only re-initialize glance_store when
         # the API's configuration reloads.
         self.initialize_glance_store = initialize_glance_store
@@ -494,6 +502,12 @@ class Server(object):
         self.running = False
         os.killpg(self.pgid, signal.SIGTERM)
 
+    def disable_children(self, *args):
+        """Disable processes and wait for them to complete."""
+        signal.signal(signal.SIGUSR1, signal.SIG_IGN)
+        self._exit = True
+        raise exception.SIGUSR1Interrupt
+
     def start(self, application, default_port):
         """
         Run a WSGI server with the given application.
@@ -518,6 +532,13 @@ class Server(object):
             signal.signal(signal.SIGTERM, self.kill_children)
             signal.signal(signal.SIGINT, self.kill_children)
             signal.signal(signal.SIGHUP, self.hup)
+
+            # Adding this to detect if a parent dies abruptly
+            rfd, self.writepipe = os.pipe()
+            self.readpipe = eventlet.greenio.GreenPipe(rfd, 'r')
+
+            if CONF.graceful_shutdown:
+                signal.signal(signal.SIGUSR1, self.disable_children)
             while len(self.children) < workers:
                 self.run_child()
 
@@ -531,6 +552,9 @@ class Server(object):
         elif pid in self.stale_children:
             self.stale_children.remove(pid)
             LOG.info(_LI('Removed stale child %s'), pid)
+        elif pid == self.raw_caching_pid:
+            LOG.info(_LI('RAW caching child died %s'), pid)
+            self.raw_caching_pid = -1
         else:
             LOG.warn(_LW('Unrecognised child %s') % pid)
 
@@ -547,14 +571,34 @@ class Server(object):
         else:
             if len(self.children) < get_num_workers():
                 self.run_child()
+        if self.raw_caching_pid is not None and self.raw_caching_pid < 0:
+            LOG.error(_LE('Not respawning raw_caching child %d, cannot '
+                          'recover from termination') % self.raw_caching_pid)
+            self.running = False
 
     def wait_on_children(self):
         while self.running:
             try:
+                # WRS: Implement graceful process exit
+                if CONF.graceful_shutdown and self._exit:
+                    # Wait for children to exit and break
+                    parent = psutil.Process()
+                    children = parent.children()
+                    if self.raw_caching_pid and len(children) == 1:
+                        # RAW Caching need special treatment
+                        if children[0].pid == self.raw_caching_pid:
+                            os.kill(self.raw_caching_pid, signal.SIGTERM)
+                            break
+                    elif not len(children):
+                        LOG.info(_LI("All children have exited, "
+                                     "closing Glance"))
+                        break
+
                 pid, status = os.wait()
                 if os.WIFEXITED(status) or os.WIFSIGNALED(status):
                     self._remove_children(pid)
-                    self._verify_and_respawn_children(pid, status)
+                    if not self._exit:
+                        self._verify_and_respawn_children(pid, status)
             except OSError as err:
                 if err.errno not in (errno.EINTR, errno.ECHILD):
                     raise
@@ -563,6 +607,9 @@ class Server(object):
                 break
             except exception.SIGHUPInterrupt:
                 self.reload()
+                continue
+            except exception.SIGUSR1Interrupt:
+                self.unload()
                 continue
         eventlet.greenio.shutdown_safe(self.sock)
         self.sock.close()
@@ -603,6 +650,9 @@ class Server(object):
         self.stale_children = self.children
         self.children = set()
 
+        if self.raw_caching_pid:
+            LOG.warn(_LW('RAW Caching does not support configuration reload'))
+
         # Ensure any logging config changes are picked up
         logging.setup(CONF, 'glance')
         config.set_config_defaults()
@@ -610,8 +660,22 @@ class Server(object):
         self.configure(old_conf, has_changed)
         self.start_wsgi()
 
-    def wait(self):
+    def unload(self):
+        """
+        Finish existing processes and exist
+
+        Existing child processes are sent a SIGHUP signal
+        and will exit after completing existing requests.
+        """
+        try:
+            os.killpg(self.pgid, signal.SIGHUP)
+        except exception.SIGHUPInterrupt:
+            pass
+
+    def wait(self, raw_caching_pid=None):
         """Wait until all servers have completed running."""
+        if raw_caching_pid:
+            self.raw_caching_pid = raw_caching_pid
         try:
             if self.children:
                 self.wait_on_children()
@@ -624,6 +688,8 @@ class Server(object):
         def child_hup(*args):
             """Shuts down child processes, existing requests are handled."""
             signal.signal(signal.SIGHUP, signal.SIG_IGN)
+            if CONF.graceful_shutdown:
+                signal.signal(signal.SIGUSR1, signal.SIG_IGN)
             eventlet.wsgi.is_accepting = False
             self.sock.close()
 
@@ -631,6 +697,8 @@ class Server(object):
         if pid == 0:
             signal.signal(signal.SIGHUP, child_hup)
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            if CONF.graceful_shutdown:
+                signal.signal(signal.SIGUSR1, child_hup)
             # ignore the interrupt signal to avoid a race whereby
             # a child worker receives the signal before the parent
             # and is respawned unnecessarily as a result
@@ -648,6 +716,26 @@ class Server(object):
             LOG.info(_LI('Started child %s'), pid)
             self.children.add(pid)
 
+    def _pipe_watcher(self):
+        def _on_timeout_exit(*args):
+            LOG.info(_LI('Graceful shutdown timeout exceeded, '
+                         'instantaneous exiting'))
+            os._exit(1)
+
+        # This will block until the write end is closed when the parent
+        # dies unexpectedly
+
+        self.readpipe.read(1)
+        LOG.info(_LI('Parent process has died unexpectedly, exiting'))
+
+        # allow up to 1 second for sys.exit to gracefully shutdown
+        signal.signal(signal.SIGALRM, _on_timeout_exit)
+        signal.alarm(1)
+        # do the same cleanup as child_hup
+        eventlet.wsgi.is_accepting = False
+        self.sock.close()
+        sys.exit(1)
+
     def run_server(self):
         """Run a WSGI server."""
         if cfg.CONF.pydev_worker_debug_host:
@@ -656,6 +744,12 @@ class Server(object):
 
         eventlet.wsgi.HttpProtocol.default_request_version = "HTTP/1.0"
         self.pool = self.create_pool()
+
+        # Close write to ensure only parent has it open
+        os.close(self.writepipe)
+        # Create greenthread to watch for parent to close pipe
+        eventlet.spawn_n(self._pipe_watcher)
+
         try:
             eventlet.wsgi.server(self.sock,
                                  self.application,

@@ -32,6 +32,7 @@ import glance.gateway
 from glance.i18n import _, _LE, _LI
 import glance.notifier
 
+from glance import cache_raw
 
 LOG = logging.getLogger(__name__)
 
@@ -133,6 +134,13 @@ class ImageDataController(object):
                 image_repo.save(image, from_state='queued')
                 image.set_data(data, size)
 
+                # WRS: Update image store
+                if image.locations and len(image.locations):
+                    locations = [loc['url'].split(':')[0]
+                                 for loc in image.locations]
+                    store = ", ".join(locations)
+                    image.extra_properties['store'] = store
+
                 try:
                     image_repo.save(image, from_state='saving')
                 except exception.NotAuthenticated:
@@ -152,6 +160,10 @@ class ImageDataController(object):
                     LOG.info(_LI("Unable to delete trust %(trust)s: %(msg)s"),
                              {"trust": refresher.trust_id,
                               "msg": encodeutils.exception_to_unicode(e)})
+
+                # WRS: Hook raw_caching
+                if image.status == 'active':
+                    cache_raw.create_image_cache(req.context, image_id)
 
             except (glance_store.NotFound,
                     exception.ImageNotFound,
@@ -372,6 +384,12 @@ class RequestDeserializer(wsgi.JSONRequestDeserializer):
             request.is_body_readable = True
 
         image_size = request.content_length or None
+        if image_size is None or image_size == 0:
+            image_size = request.headers.get('X-Image-Meta-Size', 0)
+            if image_size is None or image_size == 'None':
+                image_size = 0
+            else:
+                image_size = int(image_size)
         return {'size': image_size, 'data': request.body_file}
 
     def stage(self, request):
@@ -387,6 +405,13 @@ class RequestDeserializer(wsgi.JSONRequestDeserializer):
             request.is_body_readable = True
 
         image_size = request.content_length or None
+        if image_size is None or image_size == 0:
+            image_size = request.headers.get('X-Image-Meta-Size', 0)
+            if image_size is None or image_size == 'None':
+                image_size = 0
+            else:
+                image_size = int(image_size)
+
         return {'size': image_size, 'data': request.body_file}
 
 

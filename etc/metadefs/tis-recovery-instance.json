@@ -1,0 +1,24 @@
+{
+    "display_name": "WRS Recovery Properties",
+    "namespace": "TiS::Compute::RecoveryInstance",
+    "description": "When booting an instance, you may specify its Recovery properties.",
+    "visibility": "public",
+    "protected": true,
+    "resource_type_associations" : [
+        {
+            "name": "OS::Nova::Server",
+            "properties_target": "metadata"
+        }
+    ],
+    "properties": {
+        "sw:wrs:recovery_priority": {
+            "title": "Recovery Priority",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10,
+            "default": 1,
+            "description": "The priority used to order the recovery of instances (1 is highest and 10 is lowest). If unspecified, this value defaults to 10."
+        }
+    },
+    "objects": []
+}

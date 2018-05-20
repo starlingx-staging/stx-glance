@@ -162,6 +162,15 @@ class TestDBPurge(base.DBPurgeTests,
         self.addCleanup(db_tests.reset)
 
 
+class TestWRSDBPurge(base.WRSDBPurgeTests,
+                     base.FunctionalInitWrapper):
+
+    def setUp(self):
+        db_tests.load(get_db, reset_db)
+        super(TestWRSDBPurge, self).setUp()
+        self.addCleanup(db_tests.reset)
+
+
 class TestMetadefSqlAlchemyDriver(base_metadef.TestMetadefDriver,
                                   base_metadef.MetadefDriverTests,
                                   base.FunctionalInitWrapper):

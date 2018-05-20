@@ -34,9 +34,11 @@ from glance.common import utils
 from glance.common import wsgi
 import glance.db
 import glance.gateway
-from glance.i18n import _, _LW
+from glance.i18n import _, _LI, _LW
 import glance.notifier
 import glance.schema
+
+from glance import cache_raw
 
 LOG = logging.getLogger(__name__)
 
@@ -62,6 +64,9 @@ class ImagesController(object):
         image_factory = self.gateway.get_image_factory(req.context)
         image_repo = self.gateway.get_repo(req.context)
         try:
+            # WRS: FIXME: Refactor the property validation to fit with schema
+            # methodology
+            self._validate_image_properties(req, extra_properties)
             image = image_factory.new_image(extra_properties=extra_properties,
                                             tags=tags, **image)
             image_repo.add(image)
@@ -82,11 +87,77 @@ class ImagesController(object):
             raise webob.exc.HTTPConflict(explanation=e.msg)
         except exception.NotAuthenticated as e:
             raise webob.exc.HTTPUnauthorized(explanation=e.msg)
+        except exception.ImageOperationNotPermitted as e:
+            raise webob.exc.HTTPBadRequest(explanation=e.msg)
         except TypeError as e:
             LOG.debug(encodeutils.exception_to_unicode(e))
             raise webob.exc.HTTPBadRequest(explanation=e)
 
         return image
+
+    # WRS: FIXME: Refactor the property validation to fit with schema
+    # methodology
+    def _validate_image_properties(self, req, properties):
+        if not properties:
+            return
+
+        """
+        validate hw_wrs_live_migration_max_downtime property
+        """
+        prop_value = properties.get('hw_wrs_live_migration_max_downtime')
+        if prop_value:
+            LOG.info(_LI('hw_wrs_live_migration_max_downtime: %s') %
+                     prop_value)
+            try:
+                prop_value = int(prop_value)
+            except ValueError:
+                msg = _('hw_wrs_live_migration_max_downtime must '
+                        'be a number greater than or equal to '
+                        '100, value: %s') % prop_value
+                raise webob.exc.HTTPBadRequest(explanation=msg, request=req)
+
+            if prop_value < 100:
+                msg = _('hw_wrs_live_migration_max_downtime must '
+                        'be a number greater than or equal to '
+                        '100, value: %s') % prop_value
+                raise webob.exc.HTTPBadRequest(explanation=msg, request=req)
+
+        """
+        validate hw_wrs_live_migration_timeout property
+        """
+        prop_value = properties.get('hw_wrs_live_migration_timeout')
+        if prop_value:
+            LOG.info(_LI('hw_wrs_live_migration_timeout: %s') % prop_value)
+            try:
+                prop_value = int(prop_value)
+            except ValueError:
+                msg = _('hw_wrs_live_migration_timeout must be a number '
+                        'between 120 and 800 or 0, value: %s') % prop_value
+                raise webob.exc.HTTPBadRequest(explanation=msg, request=req)
+
+            if prop_value != 0:
+                if prop_value < 120 or prop_value > 800:
+                    msg = _('hw_wrs_live_migration_timeout must '
+                            'be a number between 120 and 800 or 0,'
+                            ' value: %s') % prop_value
+                    raise webob.exc.HTTPBadRequest(explanation=msg,
+                                                   request=req)
+
+        """
+        validate sw_wrs_auto_recovery property
+        """
+        prop_value = properties.get('sw_wrs_auto_recovery')
+        if prop_value:
+            LOG.info(_LI('sw_wrs_auto_recovery: %s') % prop_value)
+            auto_recovery = prop_value.lower()
+            if 'false' == auto_recovery:
+                properties['sw_wrs_auto_recovery'] = 'False'
+            elif 'true' == auto_recovery:
+                properties['sw_wrs_auto_recovery'] = 'True'
+            else:
+                msg = _('sw_wrs_auto_recovery must be True or False, '
+                        'value: %s') % prop_value
+                raise webob.exc.HTTPBadRequest(explanation=msg, request=req)
 
     @utils.mutating
     def import_image(self, req, image_id, body):
@@ -170,6 +241,14 @@ class ImagesController(object):
 
     @utils.mutating
     def update(self, req, image_id, changes):
+        # WRS: FIXME: Refactor the property validation to fit with schema
+        # methodology
+        properties = {}
+        for change in changes:
+            if change['op'] in ['add', 'replace']:
+                properties.update({change['path'][0]: change['value']})
+        self._validate_image_properties(req, properties)
+
         image_repo = self.gateway.get_repo(req.context)
         try:
             image = image_repo.get(image_id)
@@ -266,7 +345,24 @@ class ImagesController(object):
         try:
             image = image_repo.get(image_id)
             image.delete()
+            if image.status == 'deleted':
+                try:
+                    cache_raw.delete_image_cache(req.context, image_id)
+                except Exception as ex:
+                    # Don't break Glance if a cache fails to delete
+                    msg = ("Failed to delete cache for %s image. "
+                           "Reason: %s" % (id, unicode(ex)))
+                    import sys
+                    import traceback
+                    __, __, exc_traceback = sys.exc_info()
+                    trace = traceback.format_tb(exc_traceback, limit=10)
+                    trace += [msg]
+                    LOG.error(trace)
+                    raise webob.exc.HTTPForbidden(explanation=msg,
+                                                  request=req,
+                                                  content_type="text/plain")
             image_repo.remove(image)
+
         except (glance_store.Forbidden, exception.Forbidden) as e:
             LOG.debug("User not permitted to delete image '%s'", image_id)
             raise webob.exc.HTTPForbidden(explanation=e.msg)
@@ -288,6 +384,8 @@ class ImagesController(object):
             raise webob.exc.HTTPBadRequest(explanation=e.msg)
         except exception.NotAuthenticated as e:
             raise webob.exc.HTTPUnauthorized(explanation=e.msg)
+        except exception.ImageOperationNotPermitted as e:
+            raise webob.exc.HTTPBadRequest(explanation=e.msg)
 
     def _get_locations_op_pos(self, path_pos, max_pos, allow_max):
         if path_pos is None or max_pos is None:
@@ -324,9 +422,16 @@ class ImagesController(object):
 
     def _do_add_locations(self, image, path_pos, value):
         if CONF.show_multiple_locations == False:
-            msg = _("It's not allowed to add locations if locations are "
-                    "invisible.")
-            raise webob.exc.HTTPForbidden(explanation=msg)
+            # Allow adding location for rbd images but only if there
+            # is no previous location set. This enables nova snapshot support
+            # for boot-from-image rbd backed instances.
+            if value.get('url', '').startswith('rbd://') \
+               and not image.locations:
+                pass
+            else:
+                msg = _("It's not allowed to add locations if locations are "
+                        "invisible.")
+                raise webob.exc.HTTPForbidden(explanation=msg)
 
         if image.status not in ('active', 'queued'):
             msg = _("It's not allowed to add locations if image status is "

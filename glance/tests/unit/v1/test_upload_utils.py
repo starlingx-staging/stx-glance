@@ -26,6 +26,7 @@ from glance.common import store_utils
 from glance.common import utils
 import glance.registry.client.v1.api as registry
 from glance.tests.unit import base
+from glance.tests.unit import fake_rados
 import glance.tests.unit.utils as unit_test_utils
 
 
@@ -69,9 +70,16 @@ class TestUploadUtils(base.StoreClearingUnitTest):
 
         with patch.object(registry, "update_image_metadata") as mock_registry:
             upload_utils.safe_kill(req, id, 'saving')
-            mock_registry.assert_called_once_with(req.context, id,
-                                                  {'status': 'killed'},
-                                                  from_state='saving')
+            self.assertEqual(mock_registry.call_count, 1)
+            self.assertEqual(
+                list(mock_registry.call_args[0])[:-1],
+                [req.context, id])
+            self.assertEqual(
+                mock_registry.call_args[0][-1]["status"],
+                "killed")
+            self.assertEqual(
+                mock_registry.call_args[1],
+                {'from_state': 'saving'})
 
     def test_safe_kill_with_error(self):
         req = unit_test_utils.get_fake_request()
@@ -81,7 +89,8 @@ class TestUploadUtils(base.StoreClearingUnitTest):
                           side_effect=Exception()) as mock_registry:
             upload_utils.safe_kill(req, id, 'saving')
             mock_registry.assert_called_once_with(req.context, id,
-                                                  {'status': 'killed'},
+                                                  {'status': 'killed',
+                                                   'properties': {}},
                                                   from_state='saving')
 
     @contextmanager
@@ -183,9 +192,16 @@ class TestUploadUtils(base.StoreClearingUnitTest):
                                   upload_utils.upload_data_to_store,
                                   req, image_meta, image_data, store,
                                   notifier)
-                mock_update_image_metadata.assert_called_with(
-                    req.context, image_meta['id'], {'status': 'killed'},
-                    from_state='saving')
+                self.assertTrue(mock_update_image_metadata.called)
+                self.assertEqual(
+                    list(mock_update_image_metadata.call_args[0])[:-1],
+                    [req.context, image_meta['id']])
+                self.assertEqual(
+                    mock_update_image_metadata.call_args[0][-1]["status"],
+                    "killed")
+                self.assertEqual(
+                    mock_update_image_metadata.call_args[1],
+                    {'from_state': 'saving'})
 
     def test_upload_data_to_store_mismatch_checksum(self):
         req = unit_test_utils.get_fake_request()
@@ -200,9 +216,16 @@ class TestUploadUtils(base.StoreClearingUnitTest):
                                   upload_utils.upload_data_to_store,
                                   req, image_meta, image_data, store,
                                   notifier)
-                mock_update_image_metadata.assert_called_with(
-                    req.context, image_meta['id'], {'status': 'killed'},
-                    from_state='saving')
+                self.assertTrue(mock_update_image_metadata.called)
+                self.assertEqual(
+                    list(mock_update_image_metadata.call_args[0])[:-1],
+                    [req.context, image_meta['id']])
+                self.assertEqual(
+                    mock_update_image_metadata.call_args[0][-1]["status"],
+                    "killed")
+                self.assertEqual(
+                    mock_update_image_metadata.call_args[1],
+                    {'from_state': 'saving'})
 
     def _test_upload_data_to_store_exception(self, exc_class, expected_class):
         req = unit_test_utils.get_fake_request()
@@ -214,8 +237,10 @@ class TestUploadUtils(base.StoreClearingUnitTest):
                 self.assertRaises(expected_class,
                                   upload_utils.upload_data_to_store,
                                   req, image_meta, image_data, store, notifier)
-                mock_safe_kill.assert_called_once_with(
-                    req, image_meta['id'], 'saving')
+                self.assertEqual(mock_safe_kill.call_count, 1)
+                self.assertEqual(
+                    list(mock_safe_kill.call_args[0])[:-1],
+                    [req, image_meta['id'], 'saving'])
 
     def _test_upload_data_to_store_exception_with_notify(self,
                                                          exc_class,
@@ -232,8 +257,10 @@ class TestUploadUtils(base.StoreClearingUnitTest):
                                   req, image_meta, image_data, store,
                                   notifier)
                 if image_killed:
-                    mock_safe_kill.assert_called_with(req, image_meta['id'],
-                                                      'saving')
+                    self.assertEqual(mock_safe_kill.call_count, 1)
+                    self.assertEqual(
+                        list(mock_safe_kill.call_args[0])[:-1],
+                        [req, image_meta['id'], 'saving'])
 
     def test_upload_data_to_store_raises_store_disabled(self):
         """Test StoreDisabled exception is raised while uploading data"""
@@ -286,7 +313,9 @@ class TestUploadUtils(base.StoreClearingUnitTest):
             IOError,
             webob.exc.HTTPBadRequest)
 
-    def test_upload_data_to_store_exception(self):
+    @mock.patch.object(upload_utils, 'rbd')
+    def test_upload_data_to_store_exception(self, mock_rbd):
+        mock_rbd.NoSpace = fake_rados.mock_rbd.NoSpace
         self._test_upload_data_to_store_exception_with_notify(
             Exception,
             webob.exc.HTTPInternalServerError)
@@ -315,8 +344,10 @@ class TestUploadUtils(base.StoreClearingUnitTest):
                         mock_initiate_del.assert_called_once_with(
                             req, {'url': location, 'status': 'active',
                                   'metadata': {}}, image_meta['id'])
-                        mock_safe_kill.assert_called_once_with(
-                            req, image_meta['id'], 'saving')
+                        self.assertEqual(mock_safe_kill.call_count, 1)
+                        self.assertEqual(
+                            list(mock_safe_kill.call_args[0])[:-1],
+                            [req, image_meta['id'], 'saving'])
 
     @mock.patch.object(registry, 'update_image_metadata',
                        side_effect=exception.NotAuthenticated)
