@@ -78,6 +78,9 @@ class KeystoneStrategy(BaseStrategy):
         self.creds = creds
         self.insecure = insecure
         self.configure_via_auth = configure_via_auth
+        if creds:
+            self.configure_via_auth = self.creds.get('use_user_token',
+                                                     configure_via_auth)
         super(KeystoneStrategy, self).__init__()
 
     def check_auth_params(self):
@@ -255,10 +258,14 @@ class KeystoneStrategy(BaseStrategy):
 
         if resp.status == 201:
             resp_auth = resp['x-subject-token']
+            resp_auth_data = jsonutils.loads(resp_body)['token']
             creds_region = self.creds.get('region')
             if self.configure_via_auth:
-                endpoint = get_endpoint(resp_auth['serviceCatalog'],
-                                        endpoint_region=creds_region)
+                endpoint = get_v3_endpoint(
+                    resp_auth, resp_auth_data['catalog'],
+                    endpoint_region=creds_region,
+                    endpoint_type='internal')
+
                 self.management_url = endpoint
             self.auth_token = resp_auth
         elif resp.status == 305:
@@ -314,6 +321,32 @@ def get_endpoint(service_catalog, service_type='image', endpoint_region=None,
     ).get_urls(service_type=service_type,
                region_name=endpoint_region,
                endpoint_type=endpoint_type)
+    if endpoints is None:
+        raise exception.NoServiceEndpoint()
+    elif len(endpoints) == 1:
+        return endpoints[0]
+    else:
+        raise exception.RegionAmbiguity(region=endpoint_region)
+
+
+def get_v3_endpoint(token, service_catalog, service_type='image',
+                    endpoint_region=None,
+                    endpoint_type='public'):
+    """
+    Select an endpoint from the service catalog
+
+    We search the full service catalog for services
+    matching both type and region. If the client
+    supplied no region then any 'image' endpoint
+    is considered a match. There must be one -- and
+    only one -- successful match in the catalog,
+    otherwise we will raise an exception.
+    """
+    endpoints = ks_service_catalog\
+        .ServiceCatalogV3(token, {'catalog': service_catalog})\
+        .get_urls(service_type=service_type,
+                  region_name=endpoint_region,
+                  endpoint_type=endpoint_type)
     if endpoints is None:
         raise exception.NoServiceEndpoint()
     elif len(endpoints) == 1:

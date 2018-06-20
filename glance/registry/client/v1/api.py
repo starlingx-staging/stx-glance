@@ -136,9 +136,11 @@ def configure_registry_admin_creds():
         'password': CONF.admin_password,
         'username': CONF.admin_user,
         'tenant': CONF.admin_tenant_name,
+        'project_name': CONF.admin_tenant_name,
         'auth_url': os.getenv('OS_AUTH_URL') or CONF.auth_url,
         'strategy': strategy,
         'region': CONF.auth_region,
+        'use_user_token': False,
     }
 
 
