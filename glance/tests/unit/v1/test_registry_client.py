@@ -905,9 +905,11 @@ class TestRegistryV1ClientApi(base.IsolatedUnitTest):
             'password': 'password',
             'username': 'user',
             'tenant': 'tenant',
+            'project_name': 'tenant',
             'auth_url': auth_url,
             'strategy': strategy,
-            'region': 'region'
+            'region': 'region',
+            'use_user_token': False
         }
 
     def test_configure_registry_admin_creds(self):
@@ -918,6 +920,7 @@ class TestRegistryV1ClientApi(base.IsolatedUnitTest):
         self.config(admin_tenant_name=expected['tenant'])
         self.config(auth_strategy=expected['strategy'])
         self.config(auth_region=expected['region'])
+        self.config(use_user_token=expected['use_user_token'])
         self.stubs.Set(os, 'getenv', lambda x: None)
 
         self.assertIsNone(rapi._CLIENT_CREDS)
