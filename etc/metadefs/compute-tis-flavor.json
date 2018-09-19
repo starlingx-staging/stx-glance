@@ -121,8 +121,8 @@
             "type": "boolean",
             "default": "True"
         },
-        "sw:wrs:guest:hpet": {
-            "title": "Guest Hpet timer",
+        "hw:hpet": {
+            "title": "Guest Hpet Timer",
             "description": "Enables the Hpet timer for use by guests.",
             "type": "boolean",
             "default": "False"
