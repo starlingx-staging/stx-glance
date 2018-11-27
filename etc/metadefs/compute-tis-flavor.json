@@ -23,7 +23,6 @@
             "type": "string",
             "enum": [
                 "remote",
-                "local_lvm",
                 "local_image"
             ],
             "default": "local_image"
