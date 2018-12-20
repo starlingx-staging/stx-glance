@@ -1,0 +1,62 @@
+From f6ad3a44303a1bf9abec91e1d679cdd13fb9c4f6 Mon Sep 17 00:00:00 2001
+From: Jack Ding <jack.ding@windriver.com>
+Date: Mon, 9 May 2016 20:51:39 -0400
+Subject: [PATCH 05/21] Pike Rebase: Add store info in glance image-list and
+ image-show
+
+(cherry picked from commit 34fcfa8d5c966bc77a4a6dd511adf68b2190e9a2)
+Signed-off-by: Robert Church <robert.church@windriver.com>
+---
+ glance/api/v1/images.py          | 3 +++
+ glance/api/v2/image_data.py      | 7 +++++++
+ glance/tests/unit/v1/test_api.py | 2 +-
+ 3 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/glance/api/v1/images.py b/glance/api/v1/images.py
+index 9576069..fd910a2 100644
+--- a/glance/api/v1/images.py
++++ b/glance/api/v1/images.py
+@@ -224,6 +224,9 @@ def redact_loc(image_meta, copy_dict=True):
+         new_image_meta = copy.copy(image_meta)
+     else:
+         new_image_meta = image_meta
++    # store information is useful in a dual glance backend system
++    if new_image_meta and new_image_meta.get('location', None):
++        new_image_meta['store'] = new_image_meta['location'].split(':')[0]
+     new_image_meta.pop('location', None)
+     new_image_meta.pop('location_data', None)
+     return new_image_meta
+diff --git a/glance/api/v2/image_data.py b/glance/api/v2/image_data.py
+index c7e1ceb..8835c6f 100644
+--- a/glance/api/v2/image_data.py
++++ b/glance/api/v2/image_data.py
+@@ -134,6 +134,13 @@ class ImageDataController(object):
+                 image_repo.save(image, from_state='queued')
+                 image.set_data(data, size)
+ 
++                # WRS: Update image store
++                if image.locations and len(image.locations):
++                    locations = [loc['url'].split(':')[0]
++                                 for loc in image.locations]
++                    store = ", ".join(locations)
++                    image.extra_properties['store'] = store
++
+                 try:
+                     image_repo.save(image, from_state='saving')
+                 except exception.NotAuthenticated:
+diff --git a/glance/tests/unit/v1/test_api.py b/glance/tests/unit/v1/test_api.py
+index 95a5162..7c9a081 100644
+--- a/glance/tests/unit/v1/test_api.py
++++ b/glance/tests/unit/v1/test_api.py
+@@ -3955,7 +3955,7 @@ class TestImageSerializer(base.IsolatedUnitTest):
+     def test_redact_location(self):
+         """Ensure location redaction does not change original metadata"""
+         image_meta = {'size': 3, 'id': '123', 'location': 'http://localhost'}
+-        redacted_image_meta = {'size': 3, 'id': '123'}
++        redacted_image_meta = {'size': 3, 'id': '123', 'store': 'http'}
+         copy_image_meta = copy.deepcopy(image_meta)
+         tmp_image_meta = glance.api.v1.images.redact_loc(image_meta)
+ 
+-- 
+2.7.4
+

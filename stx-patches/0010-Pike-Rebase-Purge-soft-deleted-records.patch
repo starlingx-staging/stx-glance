@@ -1,0 +1,63 @@
+From 17908cd0049e11cc0fac93ffb3d93b811d63085a Mon Sep 17 00:00:00 2001
+From: Tee Ngo <tee.ngo@windriver.com>
+Date: Wed, 29 Mar 2017 17:04:19 -0400
+Subject: [PATCH 10/21] Pike Rebase: Purge soft deleted records
+
+Purge soft deleted records
+
+- Allow the option to purge all soft deleted records.
+- Purge non soft deleted records that reference soft deleted tasks/images
+records before purging all other soft deleted records.
+- Ensure Glance tables are purged in order to avoid FK constraint violation.
+
+---
+ glance/db/sqlalchemy/api.py | 33 +++++++++++++++++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/glance/db/sqlalchemy/api.py b/glance/db/sqlalchemy/api.py
+index f404ffb..4d535af 100644
+--- a/glance/db/sqlalchemy/api.py
++++ b/glance/db/sqlalchemy/api.py
+@@ -1298,6 +1298,39 @@ def purge_deleted_rows(context, age_in_days, max_rows, session=None):
+             continue
+         if hasattr(model_class, 'deleted'):
+             tables.append(model_class.__tablename__)
++
++    # First force purging of records that are not soft deleted but
++    # are referencing soft deleted tasks/images records (e.g. task_info
++    # records). Then purge all soft deleted records in glance tables in the
++    # right order to avoid FK constraint violation.
++    #
++    # REBASE NOTE: For newly introduced tables, please make sure the child
++    #              tables are purged before the parent tables.
++    t = Table("tasks", metadata, autoload=True)
++    ti = Table("task_info", metadata, autoload=True)
++    deleted_tasks = sql.select([t.c.id]).\
++        where(t.c.deleted_at < deleted_age).\
++        limit(max_rows)
++    deleted_task_info = sql.select([ti.c.task_id]).\
++        where(ti.c.task_id.in_(deleted_tasks))
++    delete_statement = DeleteFromSelect(ti, deleted_task_info,
++                                        ti.c.task_id)
++    LOG.info(_LI('Purging deleted rows older than %(age_in_days)d day(s) '
++                 'from table %(tbl)s'),
++             {'age_in_days': age_in_days, 'tbl': ti})
++    try:
++        with session.begin():
++            result = session.execute(delete_statement)
++    except (db_exception.DBError, db_exception.DBReferenceError) as ex:
++        LOG.exception(_LE('DBError detected when force purging '
++                          'table=%(table)s: %(error)s'),
++                      {'table': ti, 'error': six.text_type(ex)})
++        raise
++
++    rows = result.rowcount
++    LOG.info(_LI('Deleted %(rows)d row(s) from table %(tbl)s'),
++             {'rows': rows, 'tbl': ti})
++
+     # get rid of FK constraints
+     for tbl in ('images', 'tasks'):
+         try:
+-- 
+2.7.4
+

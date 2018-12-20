@@ -1,0 +1,428 @@
+From b56d995c4682a2655bd3a6f1975c0231ff3745e8 Mon Sep 17 00:00:00 2001
+From: Daniel Badea <daniel.badea@windriver.com>
+Date: Fri, 8 Jan 2016 22:43:22 +0200
+Subject: [PATCH 04/21] Pike Rebase: Log image failures to FM
+
+Log image kill reason via Fault API.
+
+Bugzilla-165, no fault if glance image-create fails (API V2)
+
+Newton rebase Bugzilla link:
+http://128.224.141.87/bugzilla/show_bug.cgi?id=165
+Test scenario used: run out of space in glance image store and try
+to create a new image. This case and others (see TC5175) should be
+handled by the fix by raising a fault via FM when the
+image goes into error. This fix was ported to Newton, however it
+only applies to Glance API v1, while Newton defaults to API v2 for
+Glance. Make the necessary changes in v2 API so the fault is raised
+in the same scenario.
+
+(cherry picked from commit 5b088f61824fd1d6d32fe7f5884414aeec5de51b)
+Signed-off-by: Robert Church <robert.church@windriver.com>
+---
+ glance/api/v1/upload_utils.py             | 30 ++++++++--------
+ glance/notifier.py                        | 36 +++++++++++++++++++
+ glance/registry/api/v1/images.py          | 34 +++++++++++++++++-
+ glance/tests/unit/v1/test_upload_utils.py | 60 ++++++++++++++++++++++---------
+ 4 files changed, 129 insertions(+), 31 deletions(-)
+
+diff --git a/glance/api/v1/upload_utils.py b/glance/api/v1/upload_utils.py
+index 6aa679c..e7e1ce7 100644
+--- a/glance/api/v1/upload_utils.py
++++ b/glance/api/v1/upload_utils.py
+@@ -47,7 +47,7 @@ def initiate_deletion(req, location_data, id):
+                                                    id, location_data)
+ 
+ 
+-def _kill(req, image_id, from_state):
++def _kill(req, image_id, from_state, reason=None):
+     """
+     Marks the image status to `killed`.
+ 
+@@ -59,11 +59,13 @@ def _kill(req, image_id, from_state):
+     # needs updating to reflect the fact that queued->killed and saving->killed
+     # are both allowed.
+     registry.update_image_metadata(req.context, image_id,
+-                                   {'status': 'killed'},
++                                   {'status': 'killed',
++                                    'properties': {'kill_reason': reason}
++                                    if reason else {}},
+                                    from_state=from_state)
+ 
+ 
+-def safe_kill(req, image_id, from_state):
++def safe_kill(req, image_id, from_state, reason=None):
+     """
+     Mark image killed without raising exceptions if it fails.
+ 
+@@ -75,7 +77,7 @@ def safe_kill(req, image_id, from_state):
+     :param from_state: Permitted current status for transition to 'killed'
+     """
+     try:
+-        _kill(req, image_id, from_state)
++        _kill(req, image_id, from_state, reason)
+     except Exception:
+         LOG.exception(_LE("Unable to kill image %(id)s: ") % {'id': image_id})
+ 
+@@ -139,7 +141,7 @@ def upload_data_to_store(req, image_meta, image_data, store, notifier):
+                                                    'supplied': supplied,
+                                                    'actual': actual})
+                 LOG.error(msg)
+-                safe_kill(req, image_id, 'saving')
++                safe_kill(req, image_id, 'saving', msg)
+                 initiate_deletion(req, location_data, image_id)
+                 raise webob.exc.HTTPBadRequest(explanation=msg,
+                                                content_type="text/plain",
+@@ -199,7 +201,7 @@ def upload_data_to_store(req, image_meta, image_data, store, notifier):
+         msg = _("Error in store configuration. Adding images to store "
+                 "is disabled.")
+         LOG.exception(msg)
+-        safe_kill(req, image_id, 'saving')
++        safe_kill(req, image_id, 'saving', msg)
+         notifier.error('image.upload', msg)
+         raise webob.exc.HTTPGone(explanation=msg, request=req,
+                                  content_type='text/plain')
+@@ -220,7 +222,7 @@ def upload_data_to_store(req, image_meta, image_data, store, notifier):
+         msg = (_("Forbidden upload attempt: %s") %
+                encodeutils.exception_to_unicode(e))
+         LOG.warn(msg)
+-        safe_kill(req, image_id, 'saving')
++        safe_kill(req, image_id, 'saving', msg)
+         notifier.error('image.upload', msg)
+         raise webob.exc.HTTPForbidden(explanation=msg,
+                                       request=req,
+@@ -230,7 +232,7 @@ def upload_data_to_store(req, image_meta, image_data, store, notifier):
+         msg = (_("Image storage media is full: %s") %
+                encodeutils.exception_to_unicode(e))
+         LOG.error(msg)
+-        safe_kill(req, image_id, 'saving')
++        safe_kill(req, image_id, 'saving', msg)
+         notifier.error('image.upload', msg)
+         raise webob.exc.HTTPRequestEntityTooLarge(explanation=msg,
+                                                   request=req,
+@@ -240,7 +242,7 @@ def upload_data_to_store(req, image_meta, image_data, store, notifier):
+         msg = (_("Insufficient permissions on image storage media: %s") %
+                encodeutils.exception_to_unicode(e))
+         LOG.error(msg)
+-        safe_kill(req, image_id, 'saving')
++        safe_kill(req, image_id, 'saving', msg)
+         notifier.error('image.upload', msg)
+         raise webob.exc.HTTPServiceUnavailable(explanation=msg,
+                                                request=req,
+@@ -250,7 +252,7 @@ def upload_data_to_store(req, image_meta, image_data, store, notifier):
+         msg = (_("Denying attempt to upload image larger than %d bytes.")
+                % CONF.image_size_cap)
+         LOG.warn(msg)
+-        safe_kill(req, image_id, 'saving')
++        safe_kill(req, image_id, 'saving', msg)
+         notifier.error('image.upload', msg)
+         raise webob.exc.HTTPRequestEntityTooLarge(explanation=msg,
+                                                   request=req,
+@@ -260,7 +262,7 @@ def upload_data_to_store(req, image_meta, image_data, store, notifier):
+         msg = (_("Denying attempt to upload image because it exceeds the "
+                  "quota: %s") % encodeutils.exception_to_unicode(e))
+         LOG.warn(msg)
+-        safe_kill(req, image_id, 'saving')
++        safe_kill(req, image_id, 'saving', msg)
+         notifier.error('image.upload', msg)
+         raise webob.exc.HTTPRequestEntityTooLarge(explanation=msg,
+                                                   request=req,
+@@ -275,12 +277,12 @@ def upload_data_to_store(req, image_meta, image_data, store, notifier):
+         notifier.error('image.upload', msg)
+         with excutils.save_and_reraise_exception():
+             LOG.exception(msg)
+-            safe_kill(req, image_id, 'saving')
++            safe_kill(req, image_id, 'saving', msg)
+ 
+     except (ValueError, IOError) as e:
+         msg = _("Client disconnected before sending all data to backend")
+         LOG.warn(msg)
+-        safe_kill(req, image_id, 'saving')
++        safe_kill(req, image_id, 'saving', msg)
+         raise webob.exc.HTTPBadRequest(explanation=msg,
+                                        content_type="text/plain",
+                                        request=req)
+@@ -297,7 +299,7 @@ def upload_data_to_store(req, image_meta, image_data, store, notifier):
+         msg = (_("Failed to upload image %(id)s. Error type: %(error)s") %
+                {'id': image_id, 'error': type(e).__name__})
+         LOG.exception(msg)
+-        safe_kill(req, image_id, 'saving')
++        safe_kill(req, image_id, 'saving', msg)
+         notifier.error('image.upload', msg)
+         raise webob.exc.HTTPInternalServerError(explanation=msg,
+                                                 request=req,
+diff --git a/glance/notifier.py b/glance/notifier.py
+index d2c2075b..2ac099b 100644
+--- a/glance/notifier.py
++++ b/glance/notifier.py
+@@ -30,6 +30,15 @@ from glance.common import timeutils
+ from glance.domain import proxy as domain_proxy
+ from glance.i18n import _, _LE
+ 
++# Import Fault Manager API
++try:
++    from fm_api import constants as fm_const
++    from fm_api import fm_api
++except ImportError:
++    import mock
++    fm_const = mock.Mock()
++    fm_api = mock.Mock()
++
+ 
+ notifier_opts = [
+     cfg.StrOpt('default_publisher_id',
+@@ -135,6 +144,25 @@ def _send_notification(notify, notification_type, payload):
+         notify(notification_type, payload)
+ 
+ 
++def _raise_fm_fault(image_id, msg):
++    """
++    Raise fault with message 'msg' using FM API
++    """
++    entity_instance_id = str(image_id)
++
++    fm_api.FaultAPIs().set_fault(fm_api.Fault(
++        alarm_id=fm_const.FM_ALARM_ID_STORAGE_IMAGE,
++        alarm_state=fm_const.FM_ALARM_STATE_MSG,
++        entity_type_id=fm_const.FM_ENTITY_TYPE_SERVICE,
++        entity_instance_id=entity_instance_id,
++        severity=fm_const.FM_ALARM_SEVERITY_WARNING,
++        reason_text=msg,
++        alarm_type=fm_const.FM_ALARM_TYPE_4,
++        probable_cause=fm_const.ALARM_PROBABLE_CAUSE_UNKNOWN,
++        proposed_repair_action='Contact next level of support',
++        service_affecting=False))
++
++
+ def format_image_notification(image):
+     """
+     Given a glance.domain.Image object, return a dictionary of relevant
+@@ -428,17 +456,20 @@ class ImageProxy(NotificationProxy, domain_proxy.Image):
+         except glance_store.StorageFull as e:
+             msg = (_("Image storage media is full: %s") %
+                    encodeutils.exception_to_unicode(e))
++            _raise_fm_fault(self.repo.image_id, str(msg))
+             _send_notification(notify_error, 'image.upload', msg)
+             raise webob.exc.HTTPRequestEntityTooLarge(explanation=msg)
+         except glance_store.StorageWriteDenied as e:
+             msg = (_("Insufficient permissions on image storage media: %s")
+                    % encodeutils.exception_to_unicode(e))
++            _raise_fm_fault(self.repo.image_id, str(msg))
+             _send_notification(notify_error, 'image.upload', msg)
+             raise webob.exc.HTTPServiceUnavailable(explanation=msg)
+         except ValueError as e:
+             msg = (_("Cannot save data for image %(image_id)s: %(error)s") %
+                    {'image_id': self.repo.image_id,
+                     'error': encodeutils.exception_to_unicode(e)})
++            _raise_fm_fault(self.repo.image_id, str(msg))
+             _send_notification(notify_error, 'image.upload', msg)
+             raise webob.exc.HTTPBadRequest(
+                 explanation=encodeutils.exception_to_unicode(e))
+@@ -447,6 +478,7 @@ class ImageProxy(NotificationProxy, domain_proxy.Image):
+                      "%(image_id)s: %(error)s") %
+                    {'image_id': self.repo.image_id,
+                     'error': encodeutils.exception_to_unicode(e)})
++            _raise_fm_fault(self.repo.image_id, str(msg))
+             _send_notification(notify_error, 'image.upload', msg)
+             raise webob.exc.HTTPConflict(explanation=msg)
+         except exception.Forbidden as e:
+@@ -454,6 +486,7 @@ class ImageProxy(NotificationProxy, domain_proxy.Image):
+                      " %(error)s")
+                    % {'image_id': self.repo.image_id,
+                       'error': encodeutils.exception_to_unicode(e)})
++            _raise_fm_fault(self.repo.image_id, str(msg))
+             _send_notification(notify_error, 'image.upload', msg)
+             raise webob.exc.HTTPForbidden(explanation=msg)
+         except exception.NotFound as e:
+@@ -462,6 +495,7 @@ class ImageProxy(NotificationProxy, domain_proxy.Image):
+                      " The image may have been deleted during the upload:"
+                      " %(error)s") % {'image_id': self.repo.image_id,
+                                       'error': exc_str})
++            _raise_fm_fault(self.repo.image_id, str(msg))
+             _send_notification(notify_error, 'image.upload', msg)
+             raise webob.exc.HTTPNotFound(explanation=exc_str)
+         except webob.exc.HTTPError as e:
+@@ -470,6 +504,7 @@ class ImageProxy(NotificationProxy, domain_proxy.Image):
+                          " due to HTTP error: %(error)s") %
+                        {'image_id': self.repo.image_id,
+                         'error': encodeutils.exception_to_unicode(e)})
++                _raise_fm_fault(self.repo.image_id, str(msg))
+                 _send_notification(notify_error, 'image.upload', msg)
+         except Exception as e:
+             with excutils.save_and_reraise_exception():
+@@ -477,6 +512,7 @@ class ImageProxy(NotificationProxy, domain_proxy.Image):
+                          "due to internal error: %(error)s") %
+                        {'image_id': self.repo.image_id,
+                         'error': encodeutils.exception_to_unicode(e)})
++                _raise_fm_fault(self.repo.image_id, str(msg))
+                 _send_notification(notify_error, 'image.upload', msg)
+         else:
+             self.send_notification('image.upload', self.repo)
+diff --git a/glance/registry/api/v1/images.py b/glance/registry/api/v1/images.py
+index 7fc00d9..cb06a4f 100644
+--- a/glance/registry/api/v1/images.py
++++ b/glance/registry/api/v1/images.py
+@@ -24,6 +24,13 @@ from oslo_utils import strutils
+ from oslo_utils import uuidutils
+ from webob import exc
+ 
++try:
++    from fm_api import constants as fm_const
++    from fm_api import fm_api
++except ImportError:
++    import mock
++    fm_const = mock.Mock()
++    fm_api = mock.Mock()
+ from glance.common import exception
+ from glance.common import timeutils
+ from glance.common import utils
+@@ -497,7 +504,32 @@ class Controller(object):
+                                                      purge_props=purge_props,
+                                                      from_state=from_state,
+                                                      v1_mode=True)
+-
++            if image_data.get('status') == 'killed':
++                kill_reason = image_data.get('properties', {}) \
++                                        .get('kill_reason')
++                if kill_reason:
++                    entity_instance_id = 'image=%(id)s' % {'id': id}
++                    try:
++                        image = make_image_dict(
++                            self.db_api.image_get(req.context, id))
++                        instance_id = image.get('properties', {}) \
++                                           .get('instance_uuid')
++                        if instance_id:
++                            entity_instance_id += ', instance=%(id)s' % {
++                                'id': instance_id}
++                    except Exception:
++                        pass
++                    fm_api.FaultAPIs().set_fault(fm_api.Fault(
++                        alarm_id=fm_const.FM_ALARM_ID_STORAGE_IMAGE,
++                        alarm_state=fm_const.FM_ALARM_STATE_MSG,
++                        entity_type_id=fm_const.FM_ENTITY_TYPE_SERVICE,
++                        entity_instance_id=entity_instance_id,
++                        severity=fm_const.FM_ALARM_SEVERITY_WARNING,
++                        reason_text=kill_reason,
++                        alarm_type=fm_const.FM_ALARM_TYPE_4,
++                        probable_cause=fm_const.ALARM_PROBABLE_CAUSE_UNKNOWN,
++                        proposed_repair_action='Contact next level of support',
++                        service_affecting=False))
+             LOG.info(_LI("Updating metadata for image %(id)s"), {'id': id})
+             return dict(image=make_image_dict(updated_image))
+         except exception.Invalid as e:
+diff --git a/glance/tests/unit/v1/test_upload_utils.py b/glance/tests/unit/v1/test_upload_utils.py
+index 4b87241..84c059f 100644
+--- a/glance/tests/unit/v1/test_upload_utils.py
++++ b/glance/tests/unit/v1/test_upload_utils.py
+@@ -70,9 +70,16 @@ class TestUploadUtils(base.StoreClearingUnitTest):
+ 
+         with patch.object(registry, "update_image_metadata") as mock_registry:
+             upload_utils.safe_kill(req, id, 'saving')
+-            mock_registry.assert_called_once_with(req.context, id,
+-                                                  {'status': 'killed'},
+-                                                  from_state='saving')
++            self.assertEqual(mock_registry.call_count, 1)
++            self.assertEqual(
++                list(mock_registry.call_args[0])[:-1],
++                [req.context, id])
++            self.assertEqual(
++                mock_registry.call_args[0][-1]["status"],
++                "killed")
++            self.assertEqual(
++                mock_registry.call_args[1],
++                {'from_state': 'saving'})
+ 
+     def test_safe_kill_with_error(self):
+         req = unit_test_utils.get_fake_request()
+@@ -82,7 +89,8 @@ class TestUploadUtils(base.StoreClearingUnitTest):
+                           side_effect=Exception()) as mock_registry:
+             upload_utils.safe_kill(req, id, 'saving')
+             mock_registry.assert_called_once_with(req.context, id,
+-                                                  {'status': 'killed'},
++                                                  {'status': 'killed',
++                                                   'properties': {}},
+                                                   from_state='saving')
+ 
+     @contextmanager
+@@ -184,9 +192,16 @@ class TestUploadUtils(base.StoreClearingUnitTest):
+                                   upload_utils.upload_data_to_store,
+                                   req, image_meta, image_data, store,
+                                   notifier)
+-                mock_update_image_metadata.assert_called_with(
+-                    req.context, image_meta['id'], {'status': 'killed'},
+-                    from_state='saving')
++                self.assertTrue(mock_update_image_metadata.called)
++                self.assertEqual(
++                    list(mock_update_image_metadata.call_args[0])[:-1],
++                    [req.context, image_meta['id']])
++                self.assertEqual(
++                    mock_update_image_metadata.call_args[0][-1]["status"],
++                    "killed")
++                self.assertEqual(
++                    mock_update_image_metadata.call_args[1],
++                    {'from_state': 'saving'})
+ 
+     def test_upload_data_to_store_mismatch_checksum(self):
+         req = unit_test_utils.get_fake_request()
+@@ -201,9 +216,16 @@ class TestUploadUtils(base.StoreClearingUnitTest):
+                                   upload_utils.upload_data_to_store,
+                                   req, image_meta, image_data, store,
+                                   notifier)
+-                mock_update_image_metadata.assert_called_with(
+-                    req.context, image_meta['id'], {'status': 'killed'},
+-                    from_state='saving')
++                self.assertTrue(mock_update_image_metadata.called)
++                self.assertEqual(
++                    list(mock_update_image_metadata.call_args[0])[:-1],
++                    [req.context, image_meta['id']])
++                self.assertEqual(
++                    mock_update_image_metadata.call_args[0][-1]["status"],
++                    "killed")
++                self.assertEqual(
++                    mock_update_image_metadata.call_args[1],
++                    {'from_state': 'saving'})
+ 
+     def _test_upload_data_to_store_exception(self, exc_class, expected_class):
+         req = unit_test_utils.get_fake_request()
+@@ -215,8 +237,10 @@ class TestUploadUtils(base.StoreClearingUnitTest):
+                 self.assertRaises(expected_class,
+                                   upload_utils.upload_data_to_store,
+                                   req, image_meta, image_data, store, notifier)
+-                mock_safe_kill.assert_called_once_with(
+-                    req, image_meta['id'], 'saving')
++                self.assertEqual(mock_safe_kill.call_count, 1)
++                self.assertEqual(
++                    list(mock_safe_kill.call_args[0])[:-1],
++                    [req, image_meta['id'], 'saving'])
+ 
+     def _test_upload_data_to_store_exception_with_notify(self,
+                                                          exc_class,
+@@ -233,8 +257,10 @@ class TestUploadUtils(base.StoreClearingUnitTest):
+                                   req, image_meta, image_data, store,
+                                   notifier)
+                 if image_killed:
+-                    mock_safe_kill.assert_called_with(req, image_meta['id'],
+-                                                      'saving')
++                    self.assertEqual(mock_safe_kill.call_count, 1)
++                    self.assertEqual(
++                        list(mock_safe_kill.call_args[0])[:-1],
++                        [req, image_meta['id'], 'saving'])
+ 
+     def test_upload_data_to_store_raises_store_disabled(self):
+         """Test StoreDisabled exception is raised while uploading data"""
+@@ -318,8 +344,10 @@ class TestUploadUtils(base.StoreClearingUnitTest):
+                         mock_initiate_del.assert_called_once_with(
+                             req, {'url': location, 'status': 'active',
+                                   'metadata': {}}, image_meta['id'])
+-                        mock_safe_kill.assert_called_once_with(
+-                            req, image_meta['id'], 'saving')
++                        self.assertEqual(mock_safe_kill.call_count, 1)
++                        self.assertEqual(
++                            list(mock_safe_kill.call_args[0])[:-1],
++                            [req, image_meta['id'], 'saving'])
+ 
+     @mock.patch.object(registry, 'update_image_metadata',
+                        side_effect=exception.NotAuthenticated)
+-- 
+2.7.4
+

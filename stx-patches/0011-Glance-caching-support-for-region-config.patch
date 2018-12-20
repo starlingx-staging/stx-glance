@@ -1,0 +1,137 @@
+From d52a147e15e038f49d7c5f939e859330d707c142 Mon Sep 17 00:00:00 2001
+From: Stefan Dinescu <stefan.dinescu@windriver.com>
+Date: Tue, 21 Nov 2017 14:54:21 +0000
+Subject: [PATCH 11/21] Glance caching support for region config
+
+In case glance services are configured as a shared service
+as part of a region config, images are cached in the secondary
+region and future requests for those images go to the cache.
+
+These changes are transparent to the primary region cloud,
+so it should work with any 3rd party openstack solution.
+
+Changes made:
+- add keystone V3 support from within glance; this is used for
+  glance caching management apps
+- in the secondary region, overwrite the glance image location
+  to a glance location.
+  This is because the registry service from the primary region
+  provides a file location (file://opt/cgcs/...) which is only
+  valid for the primary region.
+---
+ glance/common/auth.py | 45 ++++++++++++++++++++++++++++++++++++++++++++-
+ glance/location.py    | 27 +++++++++++++++++++++++++++
+ 2 files changed, 71 insertions(+), 1 deletion(-)
+
+diff --git a/glance/common/auth.py b/glance/common/auth.py
+index 3a5e94a..3578a4e 100644
+--- a/glance/common/auth.py
++++ b/glance/common/auth.py
+@@ -116,7 +116,11 @@ class KeystoneStrategy(BaseStrategy):
+             token_url = urlparse.urljoin(auth_url, "tokens")
+             # 1. Check Keystone version
+             is_v2 = auth_url.rstrip('/').endswith('v2.0')
+-            if is_v2:
++            is_v3 = auth_url.rstrip('/').endswith('v3')
++            if is_v3:
++                token_url = urlparse.urljoin(auth_url, "auth/tokens")
++                self._v3_auth(token_url)
++            elif is_v2:
+                 self._v2_auth(token_url)
+             else:
+                 self._v1_auth(token_url)
+@@ -225,6 +229,45 @@ class KeystoneStrategy(BaseStrategy):
+         else:
+             raise Exception(_('Unexpected response: %s') % resp.status)
+ 
++    def _v3_auth(self, token_url):
++        creds = self.creds
++
++        creds = {
++            "auth": {
++                "identity": {
++                    "methods": ["password"],
++                    "password": {
++                        "user": {
++                            "name": creds['username'],
++                            "domain": {"id": "default"},
++                            "password": creds['password']
++                        }
++                    }
++                }
++            }
++        }
++
++        headers = {'Content-Type': 'application/json'}
++        req_body = jsonutils.dumps(creds)
++
++        resp, resp_body = self._do_request(
++            token_url, 'POST', headers=headers, body=req_body)
++
++        if resp.status == 201:
++            resp_auth = resp['x-subject-token']
++            creds_region = self.creds.get('region')
++            if self.configure_via_auth:
++                endpoint = get_endpoint(resp_auth['serviceCatalog'],
++                                        endpoint_region=creds_region)
++                self.management_url = endpoint
++            self.auth_token = resp_auth
++        elif resp.status == 305:
++            raise exception.RedirectException(resp['location'])
++        elif resp.status == 400:
++            raise exception.AuthBadRequest(url=token_url)
++        elif resp.status == 401:
++            raise Exception(_('Unexpected response: %s') % resp.status)
++
+     @property
+     def is_authenticated(self):
+         return self.auth_token is not None
+diff --git a/glance/location.py b/glance/location.py
+index f7f2250..cf8bbf4 100644
+--- a/glance/location.py
++++ b/glance/location.py
+@@ -31,7 +31,14 @@ import glance.domain.proxy
+ from glance.i18n import _, _LE, _LI, _LW
+ 
+ 
++glance_remote_registry_opts = [
++    cfg.StrOpt('remote_registry_region_name',
++               default=None,
++               help="Region of the primary cloud/region"),
++]
++
+ CONF = cfg.CONF
++CONF.register_opts(glance_remote_registry_opts)
+ LOG = logging.getLogger(__name__)
+ 
+ 
+@@ -464,6 +471,26 @@ class ImageProxy(glance.domain.proxy.Image):
+             # add a msg as usual.
+             raise store.NotFound(image=None)
+         err = None
++
++        # If glance cache is enabled, we overwrite the location
++        # to a remote glance one.
++        if CONF.remote_registry_region_name:
++            try:
++                data, size = self.store_api.get_from_backend(
++                    "glance://%s/%s" % (CONF.remote_registry_region_name,
++                                        self.image.image_id),
++                    offset=offset,
++                    chunk_size=chunk_size,
++                    context=self.context)
++
++                return data
++            except Exception as e:
++                LOG.warn(_LW('Get image %(id)s from remote glance server '
++                             'failed: %(err)s.')
++                         % {'id': self.image.image_id,
++                            'err': encodeutils.exception_to_unicode(e)})
++                err = e
++
+         for loc in self.image.locations:
+             try:
+                 data, size = self.store_api.get_from_backend(
+-- 
+2.7.4
+

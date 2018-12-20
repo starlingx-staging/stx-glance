@@ -1,0 +1,37 @@
+From 462644fedee4feb4f7cee2acd8db87713bebfc75 Mon Sep 17 00:00:00 2001
+From: Daniel Badea <daniel.badea@windriver.com>
+Date: Tue, 4 Oct 2016 07:15:07 +0000
+Subject: [PATCH 07/21] Pike Rebase: save kill/error status of deleted images
+
+(cherry picked from commit 1dcd955a47375033e049fa9c791b3b8b4a0a8331)
+Signed-off-by: Robert Church <robert.church@windriver.com>
+---
+ glance/api/v1/images.py | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/glance/api/v1/images.py b/glance/api/v1/images.py
+index fd910a2..f10e790 100644
+--- a/glance/api/v1/images.py
++++ b/glance/api/v1/images.py
+@@ -1241,6 +1241,7 @@ class Controller(controller.BaseController):
+             # See https://bugs.launchpad.net/glance/+bug/1065187
+             image = registry.update_image_metadata(req.context, id,
+                                                    {'status': status})
++            kill_reason = image.get('properties', {}).get('kill_reason')
+ 
+             try:
+                 # The image's location field may be None in the case
+@@ -1257,6 +1258,10 @@ class Controller(controller.BaseController):
+                                                    {'status': ori_status})
+ 
+             registry.delete_image_metadata(req.context, id)
++            if kill_reason is not None:
++                image = registry.update_image_metadata(
++                    req.context, id,
++                    {'properties': {'kill_reason': kill_reason}})
+         except exception.ImageNotFound as e:
+             msg = (_("Failed to find image to delete: %s") %
+                    encodeutils.exception_to_unicode(e))
+-- 
+2.7.4
+

@@ -1,0 +1,54 @@
+From ac255f67a1f79c0642f82013ab70deb74f892a10 Mon Sep 17 00:00:00 2001
+From: Alex Kozyrev <alex.kozyrev@windriver.com>
+Date: Thu, 30 Nov 2017 09:42:43 -0500
+Subject: [PATCH 13/21] Skylake-Server support in Glance
+
+---
+ etc/metadefs/compute-host-capabilities.json | 3 +++
+ etc/metadefs/compute-tis-flavor.json        | 8 ++++++--
+ 2 files changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/etc/metadefs/compute-host-capabilities.json b/etc/metadefs/compute-host-capabilities.json
+index 6e7b768..788a766 100644
+--- a/etc/metadefs/compute-host-capabilities.json
++++ b/etc/metadefs/compute-host-capabilities.json
+@@ -39,7 +39,10 @@
+                 "SandyBridge",
+                 "IvyBridge",
+                 "Haswell",
++                "Broadwell-noTSX",
+                 "Broadwell",
++                "Skylake-Client",
++                "Skylake-Server",
+                 "Delhi",
+                 "Seoul",
+                 "Abu Dhabi",
+diff --git a/etc/metadefs/compute-tis-flavor.json b/etc/metadefs/compute-tis-flavor.json
+index 1f93e85..5ad4df1 100644
+--- a/etc/metadefs/compute-tis-flavor.json
++++ b/etc/metadefs/compute-tis-flavor.json
+@@ -33,15 +33,19 @@
+             "description": "select a particular VCPU model for a VM in order to leverage advanced CPU features such as SSE4.2, AES, or AVX on the compute nodes.",
+             "type": "string",
+             "enum": [
++                "Passthrough",
++                "Conroe",
++                "Core2Duo",
++                "Penryn",
+                 "Nehalem",
+                 "Westmere",
+                 "SandyBridge",
++                "IvyBridge",
+                 "Haswell",
+                 "Broadwell-noTSX",
+                 "Broadwell",
+                 "Skylake-Client",
+-                "Passthrough",
+-                "Conroe"
++                "Skylake-Server"
+             ],
+             "default": "Nehalem"
+         },
+-- 
+2.7.4
+
