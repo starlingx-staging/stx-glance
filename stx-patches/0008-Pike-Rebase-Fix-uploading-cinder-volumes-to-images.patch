@@ -1,0 +1,84 @@
+From aae184be3889c655a688a03aa5e0fd80da7aec74 Mon Sep 17 00:00:00 2001
+From: Elena Taivan <elena.taivan@windriver.com>
+Date: Tue, 11 Oct 2016 10:14:50 +0000
+Subject: [PATCH 08/21] Pike Rebase: Fix uploading cinder volumes to images
+
+On a CEPH setup, trying to upload an image when there is not enough
+space, result in a wrong error and data not cleaned
+
+v2: Read the X-Image-Meta-Size header when deserializing a request.
+
+When sending the image data chunk by chunk, one may not set the
+Content-Length, but we still need to know the full size of the image.
+Let's use the same header as in v1 for this purpose.
+
+Based on commit in review 09b1f3a0281ad5424f107aa4a609b7da71038931.
+Partial-Bug: #1627147.
+
+Due to 72c727404d657197cc8f444ad3dcbdcb9aff8c79 glance commit,
+uploading cinder volumes to glance was not working due to
+cinder not sending a proper size.
+
+This fix will make cinder always send a size to glance.
+Glance will also add a check for no size received and
+properly translate it to a zero value.
+
+(cherry picked from commit 695682e6f1080610614b89686efd625f7e3611fe)
+Signed-off-by: Robert Church <robert.church@windriver.com>
+
+squashed:
+
+(cherry picked from commit 09382046585f230ea6f7d04592599045edd838db)
+Signed-off-by: Robert Church <robert.church@windriver.com>
+---
+ glance/api/v2/image_data.py                      | 13 +++++++++++++
+ glance/tests/unit/v2/test_image_data_resource.py |  2 +-
+ 2 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/glance/api/v2/image_data.py b/glance/api/v2/image_data.py
+index 8835c6f..9bd22f1 100644
+--- a/glance/api/v2/image_data.py
++++ b/glance/api/v2/image_data.py
+@@ -384,6 +384,12 @@ class RequestDeserializer(wsgi.JSONRequestDeserializer):
+             request.is_body_readable = True
+ 
+         image_size = request.content_length or None
++        if image_size is None or image_size == 0:
++            image_size = request.headers.get('X-Image-Meta-Size', 0)
++            if image_size is None or image_size == 'None':
++                image_size = 0
++            else:
++                image_size = int(image_size)
+         return {'size': image_size, 'data': request.body_file}
+ 
+     def stage(self, request):
+@@ -399,6 +405,13 @@ class RequestDeserializer(wsgi.JSONRequestDeserializer):
+             request.is_body_readable = True
+ 
+         image_size = request.content_length or None
++        if image_size is None or image_size == 0:
++            image_size = request.headers.get('X-Image-Meta-Size', 0)
++            if image_size is None or image_size == 'None':
++                image_size = 0
++            else:
++                image_size = int(image_size)
++
+         return {'size': image_size, 'data': request.body_file}
+ 
+ 
+diff --git a/glance/tests/unit/v2/test_image_data_resource.py b/glance/tests/unit/v2/test_image_data_resource.py
+index 3f68ddf..e05d287 100644
+--- a/glance/tests/unit/v2/test_image_data_resource.py
++++ b/glance/tests/unit/v2/test_image_data_resource.py
+@@ -487,7 +487,7 @@ class TestImageDataDeserializer(test_utils.BaseTestCase):
+         output = self.deserializer.upload(request)
+         data = output.pop('data')
+         self.assertEqual('YYY', data.read())
+-        expected = {'size': None}
++        expected = {'size': 0}
+         self.assertEqual(expected, output)
+ 
+     def test_upload_chunked_with_content_length(self):
+-- 
+2.7.4
+

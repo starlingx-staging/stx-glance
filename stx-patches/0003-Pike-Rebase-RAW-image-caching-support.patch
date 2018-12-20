@@ -1,0 +1,1692 @@
+From 1bd70d20398c9fbd21a2a64eef96bfd428e978e2 Mon Sep 17 00:00:00 2001
+From: Ovidiu Poncea <ovidiu.poncea@windriver.com>
+Date: Wed, 23 Dec 2015 13:57:52 +0200
+Subject: [PATCH 03/21] Pike Rebase: RAW image caching support
+
+Add RAW caching image feature
+
+Add the possibility to convert an image from any supported format and
+cache it as RAW in the RBD image store thus allowing direct cloning of
+images into volumes.
+
+This commit also:
+ - replaces Kilo functions with Mitaka equivalent
+ - fixes two possible racing issue when deleting V2 images
+ - added retries when swacting while caching a large image
+
+rbd image-feature syntax change
+
+The move to Jewel from Hammer requires a minor syntax change to rbd
+import.
+
+Improve RAW Caching usage and size reporting
+
+This commit implements:
+ - Fix used space for a RAW Image. We were reporting real used space
+   instead of reserved space (e.g. for a CentOS image Ceph reserved
+   space is 8GB while the data written to Ceph RBD is just 908MB).
+ - Report reservations of space for RAW Cache file importing to the
+   glance_store RBD driver so that, when glance creates new images,
+   it can also account for this space when computing cluster storage
+   requirements.
+ - Added exclusive locking synchronization mechanism between RAW
+   Caching process and glance-api processes cluster usage computing.
+   This mechanism was already used by glance-api and we are extending
+   it also for RAW Caching too.
+
+cache-raw not processing requests
+
+glance-api recovery after kill (commit:
+5a125edea4c49ced2d64bf3c6cf8fcf591f6e69c) added _pipe_watcher to catch
+parent process exit. It does a blocking read on pipe fd and because
+eventlet is not completely removed the main cache-raw request processing
+loop is blocked (same thread).
+
+Fix: use eventlet.spawn for _pipe_watcher and keep pipe fd non blocking.
+
+glance-api recovery after kill
+
+Cause:
+- glance-api wsgi server spawns worker children
+- children share a pipe with the parent process and can sense when
+  parent is killed because read() on pipe returns an error
+- cache raw forks the wsgi server but doesn't close the write end of
+  the pipe
+- so when wsgi server (group leader) is killed with SIGKILL then read
+  pipe endpoints do not return an error
+- workers continue to run and keep listening on glance-api ports
+  (sockets)
+- SM tries to restart glance-api server but that fails because of
+  existing/already running workers
+
+Fix:
+- close wsgi server write pipe endpoint
+- handle closing of parent pipe in cache raw process so it exists when
+  parent dies - like all other workers
+
+Move image conversion to the new non drbd partition
+
+This provides a performance improvement for RAW image caching and
+reduces cpu & networking resource usage on the controller. Also, the new
+partition is configurable
+
+(cherry picked from commit 24927dc8e410657540d093fc335671aeb34aa7aa)
+Signed-off-by: Robert Church <robert.church@windriver.com>
+---
+ etc/glance-api.conf                                |   4 +
+ glance/api/v1/images.py                            |  15 +
+ glance/api/v2/image_data.py                        |   5 +
+ glance/api/v2/images.py                            |  19 +
+ glance/cache_raw.py                                | 839 +++++++++++++++++++++
+ glance/cmd/api.py                                  |  11 +-
+ glance/common/exception.py                         |  24 +
+ glance/common/imageutils.py                        | 157 ++++
+ glance/common/wsgi.py                              |  15 +-
+ .../integration/legacy_functional/test_v1_api.py   |  27 +-
+ glance/tests/unit/fake_cache_raw.py                |  27 +
+ glance/tests/unit/v1/test_api.py                   |  62 +-
+ tox.ini                                            |   2 +-
+ 13 files changed, 1186 insertions(+), 21 deletions(-)
+ create mode 100644 glance/cache_raw.py
+ create mode 100644 glance/common/imageutils.py
+ create mode 100644 glance/tests/unit/fake_cache_raw.py
+
+diff --git a/etc/glance-api.conf b/etc/glance-api.conf
+index f06cebd..9cf5338 100644
+--- a/etc/glance-api.conf
++++ b/etc/glance-api.conf
+@@ -1772,6 +1772,10 @@
+ # exchange name specified in the transport_url option. (string value)
+ #control_exchange = openstack
+ 
++# The temporary folder for doing conversions.
++# Warning: Content of this folder is removed when glance-api starts
++cache_raw_conversion_dir = /opt/img-conversions/glance
++
+ 
+ [cors]
+ 
+diff --git a/glance/api/v1/images.py b/glance/api/v1/images.py
+index 1b19246..9576069 100644
+--- a/glance/api/v1/images.py
++++ b/glance/api/v1/images.py
+@@ -50,6 +50,7 @@ import glance.api.v1
+ from glance.api.v1 import controller
+ from glance.api.v1 import filters
+ from glance.api.v1 import upload_utils
++from glance import cache_raw
+ from glance.common import exception
+ from glance.common import property_utils
+ from glance.common import store_utils
+@@ -787,6 +788,7 @@ class Controller(controller.BaseController):
+                                                              from_state=s)
+             self.notifier.info("image.activate", redact_loc(image_meta_data))
+             self.notifier.info("image.update", redact_loc(image_meta_data))
++            cache_raw.create_image_cache(req.context, image_id)
+             return image_meta_data
+         except exception.Duplicate:
+             with excutils.save_and_reraise_exception():
+@@ -1213,6 +1215,19 @@ class Controller(controller.BaseController):
+         if image['location'] and CONF.delayed_delete:
+             status = 'pending_delete'
+         else:
++            try:
++                cache_raw.delete_image_cache(req.context, id, image)
++            except Exception as ex:
++                msg = ("Failed to delete cache for %s image. "
++                       "Reason: %s" % (id, unicode(ex)))
++                import sys
++                import traceback
++                exc_type, exc_value, exc_traceback = sys.exc_info()
++                trace = traceback.format_tb(exc_traceback, limit=10) + [msg]
++                LOG.error(trace)
++                raise HTTPForbidden(explanation=msg,
++                                    request=req,
++                                    content_type="text/plain")
+             status = 'deleted'
+ 
+         ori_status = image['status']
+diff --git a/glance/api/v2/image_data.py b/glance/api/v2/image_data.py
+index 0c1786d..c7e1ceb 100644
+--- a/glance/api/v2/image_data.py
++++ b/glance/api/v2/image_data.py
+@@ -32,6 +32,7 @@ import glance.gateway
+ from glance.i18n import _, _LE, _LI
+ import glance.notifier
+ 
++from glance import cache_raw
+ 
+ LOG = logging.getLogger(__name__)
+ 
+@@ -153,6 +154,10 @@ class ImageDataController(object):
+                              {"trust": refresher.trust_id,
+                               "msg": encodeutils.exception_to_unicode(e)})
+ 
++                # WRS: Hook raw_caching
++                if image.status == 'active':
++                    cache_raw.create_image_cache(req.context, image_id)
++
+             except (glance_store.NotFound,
+                     exception.ImageNotFound,
+                     exception.Conflict):
+diff --git a/glance/api/v2/images.py b/glance/api/v2/images.py
+index f43525d..e7de059 100644
+--- a/glance/api/v2/images.py
++++ b/glance/api/v2/images.py
+@@ -38,6 +38,8 @@ from glance.i18n import _, _LI, _LW
+ import glance.notifier
+ import glance.schema
+ 
++from glance import cache_raw
++
+ LOG = logging.getLogger(__name__)
+ 
+ CONF = cfg.CONF
+@@ -341,7 +343,24 @@ class ImagesController(object):
+         try:
+             image = image_repo.get(image_id)
+             image.delete()
++            if image.status == 'deleted':
++                try:
++                    cache_raw.delete_image_cache(req.context, image_id)
++                except Exception as ex:
++                    # Don't break Glance if a cache fails to delete
++                    msg = ("Failed to delete cache for %s image. "
++                           "Reason: %s" % (id, unicode(ex)))
++                    import sys
++                    import traceback
++                    __, __, exc_traceback = sys.exc_info()
++                    trace = traceback.format_tb(exc_traceback, limit=10)
++                    trace += [msg]
++                    LOG.error(trace)
++                    raise webob.exc.HTTPForbidden(explanation=msg,
++                                                  request=req,
++                                                  content_type="text/plain")
+             image_repo.remove(image)
++
+         except (glance_store.Forbidden, exception.Forbidden) as e:
+             LOG.debug("User not permitted to delete image '%s'", image_id)
+             raise webob.exc.HTTPForbidden(explanation=e.msg)
+diff --git a/glance/cache_raw.py b/glance/cache_raw.py
+new file mode 100644
+index 0000000..e3ef1f2
+--- /dev/null
++++ b/glance/cache_raw.py
+@@ -0,0 +1,839 @@
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++# SPDX-License-Identifier: Apache-2.0
++#
++#
++#
++
++# vim: tabstop=4 shiftwidth=4 softtabstop=4
++
++# All Rights Reserved.
++#
++
++"""
++Glance RAW caching feature ache
++"""
++
++import logging
++from oslo_config import cfg
++
++from glance.common import exception
++from glance.common import imageutils
++from glance.context import RequestContext
++import glance.registry.client.v1.api as registry
++from glance_store._drivers import rbd as rbd_store_driver
++from glance_store import exceptions as store_exceptions
++from keystoneclient.v2_0 import client as keystoneclient
++from oslo_concurrency import lockutils
++from oslo_concurrency import processutils
++from oslo_utils import encodeutils
++from oslo_utils import timeutils
++from oslo_utils import units
++import signal
++
++try:
++    import rados
++    import rbd
++except ImportError:
++    rados = None
++    rbd = None
++
++import errno
++import os
++import shutil
++import stat
++import sys
++import time
++import traceback
++import urllib
++
++import eventlet
++import json
++
++from ctypes import c_bool
++from ctypes import c_char
++from multiprocessing import Array
++from multiprocessing import Condition
++from multiprocessing import Event
++from multiprocessing import Queue
++from multiprocessing.queues import Empty
++from multiprocessing import Value
++
++try:
++    from fm_api import constants as fm_const
++    from fm_api import fm_api
++except ImportError:
++    fm_const = None
++    fm_api = None
++
++from glance import i18n
++
++_ = i18n._
++_LE = i18n._LE
++_LI = i18n._LI
++_LW = i18n._LW
++
++LOG = logging.getLogger(__name__)
++
++cache_raw_task_opts = [
++    cfg.StrOpt('cache_raw_conversion_dir',
++               default=None,
++               help="The temporary folder for doing conversions."
++                    " Warning: Content of this folder is removed"
++                    " when glance-api starts"),
++]
++
++CONF = cfg.CONF
++CONF.register_opts(cache_raw_task_opts)
++
++_RBD_STORE = 'rbd'
++_RETRY_COUNT_BEFORE_ERROR = 30
++_RETRY_SLEEP_S = 10
++_WAIT_FOR_IMAGE_RELEASE = 1200
++
++try:
++    LOCK_DIR = rbd_store_driver.LOCK_DIR
++    LOCK_PREFIX = rbd_store_driver.LOCK_PREFIX
++    LOCK_RBD_USAGE = rbd_store_driver.LOCK_PREFIX
++    DEFAULT_POOL_RESERVATION_FILE = \
++        rbd_store_driver.DEFAULT_POOL_RESERVATION_FILE
++except AttributeError:
++    # For unit tests, upstream RBD driver does not have these
++    LOCK_DIR = "/tmp"
++    LOCK_PREFIX = "glance_"
++    LOCK_RBD_USAGE = "rbd_cluster_usage"
++    DEFAULT_POOL_RESERVATION_FILE = '/tmp/glance-space-reservations'
++
++# keep all the caching jobs arguments in a small list and execute them
++# serially, also keep context info about current conversion, useful for delete
++g_job_queue = None    # remaining conversion jobs
++g_image_id = None     # image id for current conversion, needed by image delete
++g_done_event = None   # sent when conversion is finished, needed by image del
++g_is_cache_raw_enabled = None  # feature is enabled or not
++g_delete_lock = None  # Wait for images that are caching before deleting them
++
++
++def initialize():
++    global g_job_queue, g_done_event, g_image_id
++    global g_is_cache_raw_enabled, g_delete_lock
++    g_job_queue = Queue()
++    g_done_event = Event()
++    g_image_id = Array(c_char, 100)
++    g_is_cache_raw_enabled = Value(c_bool, False)
++    g_delete_lock = Condition()
++
++
++def _clean_dir_content(path):
++    """Delete everything from a folder or create it if non-existent"""
++    if not os.path.exists(path):
++        os.makedirs(path)
++    for f in os.listdir(path):
++        file_path = os.path.join(path, f)
++        try:
++            if os.path.isfile(file_path):
++                os.unlink(file_path)
++            elif os.path.isdir(file_path):
++                shutil.rmtree(file_path)
++        except OSError as e:
++            LOG.error(_LE("Error cleaning %(path)s content: %(reason)s"),
++                      {"path": path, "reason": e})
++
++
++def _is_blk_device(dev):
++    try:
++        if stat.S_ISBLK(os.stat(dev).st_mode):
++            return True
++        return False
++    except Exception:
++        LOG.debug('Path %s not found in is_blk_device check', dev)
++        return False
++
++
++def _check_for_odirect_support(src, dest, flag='oflag=direct'):
++    """Check whether O_DIRECT flag is supported"""
++    try:
++        cmd = ('dd', 'count=0', 'if=%s' % src, 'of=%s' % dest, flag)
++        processutils.execute(*cmd)
++        return True
++    except processutils.ProcessExecutionError:
++        return False
++
++
++def _convert_image(source, dest, out_format):
++    """Convert image to other format.
++
++    Modified from Cinder
++    """
++
++    cmd = ('env', 'LC_ALL=C', 'qemu-img', 'convert',
++           '-O', out_format, source, dest)
++
++    # Check whether O_DIRECT is supported and set '-t none' if it is
++    # This is needed to ensure that all data hit the device before
++    # it gets unmapped remotely from the host for some backends
++    # Reference Bug: #1363016
++
++    # NOTE(jdg): In the case of file devices qemu does the
++    # flush properly and more efficiently than would be done
++    # setting O_DIRECT, so check for that and skip the
++    # setting for non BLK devs
++    if (_is_blk_device(dest) and
++            _check_for_odirect_support(source, dest, 'oflag=direct')):
++        cmd = ('env', 'LC_ALL=C', 'qemu-img', 'convert',
++               '-t', 'none',
++               '-O', out_format, source, dest)
++    LOG.info(_LI("Converting source: %(source)s to dest: %(dest)s "
++                 "type: %(out_format)s") %
++             {'source': source, 'dest': dest, 'out_format': out_format})
++    start_time = timeutils.utcnow()
++    processutils.execute(*cmd)
++    duration = timeutils.delta_seconds(start_time, timeutils.utcnow())
++
++    # NOTE(jdg): use a default of 1, mostly for unit test, but in
++    # some incredible event this is 0 (cirros image?) don't barf
++    if duration < 1:
++        duration = 1
++    fsz_mb = os.stat(source).st_size / units.Mi
++    mbps = (fsz_mb / duration)
++    msg = ("Image conversion details: src %(src)s, size %(sz).2f MB, "
++           "duration %(duration).2f sec, destination %(dest)s")
++    LOG.debug(msg, {"src": source,
++                    "sz": fsz_mb,
++                    "duration": duration,
++                    "dest": dest})
++
++    msg = _("Converted %(sz).2f MB image at %(mbps).2f MB/s")
++    LOG.info(msg, {"sz": fsz_mb, "mbps": mbps})
++
++
++def _qemu_img_info(path):
++    """Return a object containing the parsed output from qemu-img info."""
++    cmd = ('env', 'LC_ALL=C', 'qemu-img', 'info', path)
++    out, _err = processutils.execute(*cmd)
++    return imageutils.QemuImgInfo(out)
++
++
++def _convert_to_volume_format(src, dest, volume_format, image_id):
++    """Do the conversion safely"""
++    try:
++        data = _qemu_img_info(src)
++    except processutils.ProcessExecutionError:
++        raise exception.CachingToRawException(
++            reason=_("qemu-img is not installed. "
++                     "caching of %s is aborted") % image_id)
++
++    fmt = data.file_format
++    if fmt is None:
++        raise exception.ImageUnacceptable(
++            reason=_("'qemu-img info' parsing failed."),
++            image_id=image_id)
++
++    backing_file = data.backing_file
++    if backing_file is not None:
++        raise exception.ImageUnacceptable(
++            image_id=image_id,
++            reason=_("fmt=%(fmt)s backed by:%(backing_file)s")
++            % {'fmt': fmt, 'backing_file': backing_file, })
++
++    if fmt == volume_format:
++        raise exception.ConvertToSameFormat(
++            image_id=image_id,
++            fmt=fmt)
++
++    LOG.debug("%s was %s, caching to %s ", image_id, fmt, volume_format)
++    _convert_image(src, dest, volume_format)
++
++    data = _qemu_img_info(dest)
++    if data.file_format != volume_format:
++        raise exception.ImageUnacceptable(
++            image_id=image_id,
++            reason=_("Converted to %(vol_format)s, but format is "
++                     "now %(file_format)s") % {'vol_format': volume_format,
++                                               'file_format': data.
++                                               file_format})
++
++
++def _get_sparse_file_size(file_name):
++    """Get the real disk usage of a sparse file on disk, in bytes"""
++    # Formula: (no of allocated blocks in 512 byte blocks) * 512 + 100MB
++    # We append 100MB as sparse size on ext3 can be slightly different
++    # than on RBD.
++    return (os.stat(file_name).st_blocks * 512 + 100 * 2 ** 20)
++
++
++def _get_context():
++    k_cfg = CONF.keystone_authtoken
++    auth = keystoneclient.Client(username=k_cfg.username,
++                                 password=k_cfg.password,
++                                 tenant_name=k_cfg.project_name,
++                                 auth_url=k_cfg.auth_uri + "/v2.0")
++    return RequestContext(auth_token=auth.session.get_token(),
++                          user=k_cfg.username,
++                          tenant=k_cfg.project_name,
++                          show_deleted=True,
++                          overwrite=False)
++
++
++def _parse_rbd_location(location):
++    prefix = 'rbd://'
++    if not location.startswith(prefix):
++        # Not stored in rbd
++        return None
++    pieces = map(urllib.unquote, location[len(prefix):].split('/'))
++    if any(map(lambda p: p == '', pieces)):
++        # Blank components
++        return None
++    if len(pieces) != 4:
++        # Not an rbd snapshot
++        return None
++    return pieces
++
++
++def _fetch_to_file(image_id, image_meta, dst):
++    """Exports an image from glance to file"""
++
++    # Check if we have a RBD store and get its location
++    rbd_loc = None
++    for location in image_meta['location_data']:
++        rbd_loc = _parse_rbd_location(location['url'])
++        if rbd_loc:
++            break
++    # TODO(oponcea): If source is not a RBD image download it from Glance
++    # directly (http://docs.openstack.org/developer/python-glanceclient/)
++    # TODO(oponcea): Use mapping of an image to a RBD block device instead
++    # of import
++    if not rbd_loc:
++        reason = "Not a Ceph RBD image"
++        raise exception.CachingToRawException(image_id=image_id, reason=reason)
++    else:
++        _prefix, pool, image, _snapshot = rbd_loc
++        src = pool + "/" + image
++        LOG.info(_LI("Fetching image from %(src)s to %(dst)s") %
++                 {'src': src, 'dst': dst})
++        cmd = ('env', 'LC_ALL=C', 'rbd', 'export', src, dst)
++        _out, _err = processutils.execute(*cmd)
++    if not os.path.exists(dst):
++        reason = ("Export of the original image from glance to file failed: %s"
++                  " does not exist") % dst
++        raise exception.CachingToRawException(image_id=image_id, reason=reason)
++
++
++def _import_from_file(src_file, dest_url, image_id):
++    """import a file into RBD"""
++    # Check if we have a RBD store and get its location
++    # we only support ceph stores so no need to test for something else
++    rbd_loc = _parse_rbd_location(dest_url)
++    if not rbd_loc:
++        reason = "Not a Ceph RBD location"
++        raise exception.CachingToRawException(image_id=image_id, reason=reason)
++    LOG.info(_LI("Importing %(src_file)s to %(dest_url)s") %
++             {'src_file': src_file, 'dest_url': dest_url})
++    _prefix, pool, image, snapshot = rbd_loc
++    dst = pool + "/" + image
++    cmd = ('env', 'LC_ALL=C', 'rbd', 'import', src_file, dst,
++           '--image-format', '2',
++           '--image-feature', 'layering,exclusive-lock,object-map,fast-diff')
++    _out, _err = processutils.execute(*cmd)
++    if snapshot:
++        ceph_cfg_file = CONF.glance_store.rbd_store_ceph_conf
++        with rados.Rados(conffile=ceph_cfg_file) as cluster:
++            with cluster.open_ioctx(str(pool)) as ioctx:
++                with rbd.Image(ioctx, str(image)) as image:
++                    image.create_snap(str(snapshot))
++                    image.protect_snap(str(snapshot))
++                    # image.lock_exclusive('glance')
++
++
++def _get_rbd_image_size(dest_url, image_id):
++    """Get the size of an RBD image"""
++    rbd_loc = _parse_rbd_location(dest_url)
++    if not rbd_loc:
++        reason = "Not a Ceph RBD image"
++        raise exception.CachingToRawException(image_id=image_id, reason=reason)
++    else:
++        _prefix, pool, image, snapshot = rbd_loc
++        image_str = "%s/%s@%s" % (pool, image, snapshot)
++        cmd = ('env', 'LC_ALL=C', 'rbd', 'du', image_str,
++               '--format', 'json')
++        out, err = processutils.execute(*cmd)
++        images = json.loads(out).get("images", [])
++        if len(images) != 1 or "used_size" not in images[0]:
++            reason = ("Image disk usage query failure."
++                      "cmd: %(cmd)s, stdout: %(stdout)s, stderr: %(stderr)s" %
++                      {"cmd": cmd, "stdout": out, "stderr": err})
++            raise exception.CachingToRawException(image_id=image_id,
++                                                  reason=reason)
++        else:
++            image_size = images[0]["used_size"]
++            LOG.debug("Image %(id)s used RBD space is: %(used_size)s" %
++                      {"id": image_id, "used_size": image_size})
++            return image_size
++
++
++def _del_rbd_image(dest_url, image_id):
++    """Delete image from RBD"""
++    rbd_loc = _parse_rbd_location(dest_url)
++    if not rbd_loc:
++        reason = "Not a Ceph RBD image"
++        raise exception.InvalidRbdUrl(image_id=image_id, url=dest_url)
++    else:
++        _prefix, pool, image_name, snapshot = (str(x) for x in rbd_loc)
++        ceph_cfg_file = CONF.glance_store.rbd_store_ceph_conf
++        LOG.info(_LI("Deleting %(dest_url)s of %(image_id)s from RBD") %
++                 {'dest_url': dest_url, 'image_id': image_id})
++        with rados.Rados(conffile=ceph_cfg_file) as cluster:
++            with cluster.open_ioctx(str(pool)) as ioctx:
++                try:
++                    # First remove snapshot.
++                    if snapshot is not None:
++                        with rbd.Image(ioctx, image_name) as image:
++                            try:
++                                if image.is_protected_snap(snapshot):
++                                    image.unprotect_snap(snapshot)
++                                    # image.unlock('glance')
++                                image.remove_snap(snapshot)
++                            except rbd.ImageBusy:
++                                reason = _("snapshot %(image)s@%(snap)s could "
++                                           "not be unprotected because it is "
++                                           "in use") % {'image': image_name,
++                                                        'snap': snapshot}
++                                LOG.debug(reason)
++                                raise store_exceptions.InUseByStore()
++                            except rbd.ImageNotFound:
++                                # Not an issue if it does not have snapshots
++                                pass
++                    # Then delete image.
++                    # Note: A caching may be in progress on other controller
++                    # when glance-api is started because sometimes glance-api
++                    # process is not cleanly stopped and a 'rbd import' process
++                    # keeps our image in use for some time - we just have to
++                    # patiently wait here
++                    retry_cnt = _WAIT_FOR_IMAGE_RELEASE
++                    while True:
++                        try:
++                            rbd.RBD().remove(ioctx, image_name)
++                            break
++                        except rbd.ImageBusy:
++                            if retry_cnt <= 0:
++                                raise
++                            else:
++                                retry_cnt -= 5
++                            reason = _("image %(image)s could not be "
++                                       "removed because it is in use, "
++                                       "waiting %(time)s seconds for its "
++                                       "release") % {'image': image_name,
++                                                     'time': retry_cnt}
++                            LOG.debug(reason)
++                            time.sleep(5)
++                except rbd.ImageNotFound:
++                    # If it does not exist then that's good!
++                    pass
++                except rbd.ImageBusy:
++                    reason = _("image %s could not be removed "
++                               "because it is in use")
++                    LOG.debug(reason % image_name)
++                    raise store_exceptions.InUseByStore()
++
++
++class reserve_space(object):
++    def __init__(self, image_id, size, pool):
++        self.image_id = image_id
++        self.size = size
++        self.pool = pool
++
++    @lockutils.synchronized(LOCK_RBD_USAGE, LOCK_PREFIX, True, LOCK_DIR)
++    def __enter__(self):
++        # This function is synchronized with glance's image creation to
++        # provide correct free space computations
++        # initialize ceph connection
++        rbd_store = rbd_store_driver.Store(CONF)
++        ceph_cfg_file = CONF.glance_store.rbd_store_ceph_conf
++        with rados.Rados(conffile=ceph_cfg_file) as cluster:
++            with cluster.open_ioctx(str(self.pool)) as ioctx:
++                # Get quota
++                ceph_quota_output = json.loads(
++                    cluster.mon_command(
++                        json.dumps({
++                            "prefix": "osd pool get-quota",
++                            "pool": self.pool,
++                            "format": "json-pretty"}), "")[1])
++
++                glance_ceph_quota = ceph_quota_output.get("quota_max_bytes", 0)
++
++                rbd_store.validate_available_space(
++                    ioctx, self.image_id, self.size, glance_ceph_quota)
++
++        # Reserve space
++        # NOTE: Conversions are done serially therefore we can safely replace
++        # the old entry
++        with open(DEFAULT_POOL_RESERVATION_FILE, "w+") as f:
++            data = {"image_id": (self.image_id + '_raw'),
++                    "reserved": self.size}
++            f.write(str(data))
++        return self
++
++    def __exit__(self, dtype, value, traceback):
++        self.unreserve()
++
++    @staticmethod
++    @lockutils.synchronized(LOCK_RBD_USAGE, LOCK_PREFIX, True, LOCK_DIR)
++    def unreserve():
++        with open(DEFAULT_POOL_RESERVATION_FILE, "w+") as f:
++            f.write("{}")
++
++
++def _cache_img_to_raw(context, image_id):
++    """Cache an image to RAW"""
++
++    # Start caching
++    LOG.info(_LI("Caching image %s") % image_id)
++    image_meta = registry.get_image_metadata(context, image_id)
++    image_meta_to_update = {'properties': {'cache_raw_status': 'Caching'}}
++    registry.update_image_metadata(context, image_id, image_meta_to_update)
++
++    # Set the paths
++    base = CONF.cache_raw_conversion_dir + "/" + image_id
++    orig_file = base + "_orig"
++    converted_file = base + "_raw"
++    converted_image = image_id + "_raw"
++    # Get cluster fsid
++    ceph_cfg_file = CONF.glance_store.rbd_store_ceph_conf
++    with rados.Rados(conffile=ceph_cfg_file) as cluster:
++        fsid = cluster.get_fsid()
++    dest_url = "rbd://%s/%s/%s/%s" % (fsid,
++                                      CONF.glance_store.rbd_store_pool,
++                                      converted_image,
++                                      "snap")
++
++    # Do the conversion
++    _fetch_to_file(image_id, image_meta, orig_file)
++    try:
++        _convert_to_volume_format(orig_file, converted_file, 'raw', image_id)
++    except exception.ConvertToSameFormat as ex:
++        raise exception.ImageUncacheable(
++            image_id=image_id,
++            reason=_("The format of the image is (%(fmt)s) "
++                     "not (%(orig)s), please specify the correct format "
++                     "when creating the image") %
++            {'fmt': ex.fmt, 'orig': image_meta.get('disk_format')})
++
++    with reserve_space(image_id, _get_sparse_file_size(converted_file),
++                       CONF.glance_store.rbd_store_pool):
++        _import_from_file(converted_file, dest_url, image_id)
++
++    # Cleanup
++    os.unlink(orig_file)
++    os.unlink(converted_file)
++
++    # Finalize caching
++    image_size = _get_rbd_image_size(dest_url, image_id)
++    image_meta_to_update['properties']['cache_raw_status'] = 'Cached'
++    image_meta_to_update['properties']['cache_raw_url'] = dest_url
++    image_meta_to_update['properties']['cache_raw_size'] = image_size
++    registry.update_image_metadata(context, image_id, image_meta_to_update)
++    LOG.info(_LI("Caching completed for image: %s") % image_id)
++
++
++def _log_to_fm(msg, poposed_fix='', instance_id='', cause=None):
++    """Save an error in the customer log"""
++    # TODO(oponcea): Test and enable it or remove the code if not wanted
++    alarm_id = fm_const.FM_ALARM_ID_STORAGE_IMAGE
++    alarm_state = fm_const.FM_ALARM_STATE_MSG
++    entity_type_id = fm_const.FM_ALARM_TYPE_SERVICE
++    severity = fm_const.FM_ALARM_SEVERITY_WARNING
++    alarm_type = fm_const.FM_ALARM_TYPE_3
++    probable_cause = cause or fm_const.ALARM_PROBABLE_CAUSE_UNKNOWN
++    fix = poposed_fix
++    fm_api.FaultAPIs().set_fault(fm_api.Fault(alarm_id=alarm_id,
++                                              alarm_state=alarm_state,
++                                              entity_type_id=entity_type_id,
++                                              entity_instance_id=instance_id,
++                                              severity=severity,
++                                              reason_text=msg,
++                                              alarm_type=alarm_type,
++                                              probable_cause=probable_cause,
++                                              proposed_repair_action=fix,
++                                              service_affecting=True))
++
++
++def _pipe_watcher(server):
++    try:
++        os.read(server.readpipe.fileno(), 1)
++        LOG.info(_LI("RAW caching exit (parent died)"))
++        os._exit(1)
++    except Exception as e:
++        LOG.error(_LE("RAW caching _pipe_watcher failed: %s"), str(e))
++
++
++def start_raw_caching(server):
++    """Spawn a worker process. Function does not block"""
++    global g_is_cache_raw_enabled
++
++    # Clean any Ceph reservations left from previous runs
++    reserve_space.unreserve()
++
++    # Check if this feature should be enabled or not
++    if _RBD_STORE not in CONF.glance_store.stores:
++        LOG.info(_LI("Not using %s. RAW caching is only "
++                     "available for Ceph RBD") % _RBD_STORE)
++        return
++    if not CONF.cache_raw_conversion_dir:
++        LOG.error(_LE("Option cache_raw_conversion_dir is not defined."
++                      "Caching of images to RAW is disabled!"))
++        return
++
++    # Start the new process early, we want to avoid crashing glance if
++    # something bad happens when initializing RAW caching
++    LOG.info(_LI("RAW caching is enabled, starting it"))
++    g_is_cache_raw_enabled.value = True
++    p = os.fork()
++    if p == 0:
++        os.close(server.writepipe)
++        # Register signal handlers for child
++        if CONF.graceful_shutdown:
++            signal.signal(signal.SIGHUP, _sig_handler)
++            signal.signal(signal.SIGTERM, _sig_handler)
++            signal.signal(signal.SIGUSR1, _sig_handler)
++        # Start RAW caching main process
++        LOG.info(_LI("RAW caching start _pipe_watcher"))
++        eventlet.spawn(_pipe_watcher, server)
++        _raw_caching_manager()
++        LOG.info(_LI("RAW caching exit"))
++        sys.exit(0)
++    # Note: We have to keep track of RAW caching as WSGI think that
++    # they are the only processes around
++    server.raw_caching_pid = p
++    return p
++
++
++def _safe_update_image_metadata(context, image_id, image_meta):
++    try:
++        registry.update_image_metadata(context, image_id, image_meta)
++    except Exception as e:
++        err = encodeutils.exception_to_unicode(e)
++        LOG.error(_LE("Error updating image metadata: "
++                      "%(img)s, err: %(err)s") %
++                  {'img': image_meta['id'], 'err': err})
++
++
++def _raw_caching_manager():
++    """Spawn a worker process. Function does not block"""
++    global g_job_queue, g_image_id, g_done_event, g_delete_lock
++
++    LOG.info(_LI('RAW caching manager starting'))
++    # Communication between glance-api and glance-registry is done using REST
++    # so we need admin authentication before accessing the registry
++    retries = 0
++    while True:  # keystone has the bad habit of starting late, retry
++        try:
++            admin_context = _get_context()
++            break
++        except Exception as e:
++            retries += 1
++            err = encodeutils.exception_to_unicode(e)
++            duration = _RETRY_COUNT_BEFORE_ERROR * _RETRY_SLEEP_S
++            LOG.info(_LI("Error getting admin context for %(duration)s s,"
++                         " reason: %(reason)s") %
++                     {'duration': duration, 'reason': err})
++            if retries >= _RETRY_COUNT_BEFORE_ERROR:
++                LOG.error(_LE("Error getting admin context for %(duration)s s,"
++                              " reason: %(reason)s") %
++                          {'duration': duration, 'reason': err})
++                sys.exit()
++            time.sleep(_RETRY_SLEEP_S)
++
++    active_images = registry.get_images_detail(admin_context,
++                                               filters={"is_public": 'None',
++                                                        "deleted": "False"})
++    # Cleaning invalid conversions
++    _clean_dir_content(CONF.cache_raw_conversion_dir)
++
++    LOG.info(_LI('RAW caching restore previous images'))
++    # Restore previous images that were waiting to be cached
++    for image_meta in active_images:
++        if _is_caching_needed(image_meta):
++            try:
++                # Delete invalid conversion files
++                converted_image = image_meta['id'] + "_raw"
++                ceph_cfg_file = CONF.glance_store.rbd_store_ceph_conf
++                with rados.Rados(conffile=ceph_cfg_file) as cluster:
++                    fsid = cluster.get_fsid()
++                    images_pool = CONF.glance_store.rbd_store_pool
++                    dest_url = "rbd://%s/%s/%s/%s" % (fsid,
++                                                      images_pool,
++                                                      converted_image,
++                                                      "snap")
++                _del_rbd_image(dest_url, image_meta['id'])
++            except store_exceptions.InUseByStore as e:
++                # This is important and should not happen for an uncached
++                # img, as we don't really know what to do in this case we
++                # should at least make sure that we don't crash the main
++                # process and log the message properly
++                err = encodeutils.exception_to_unicode(e)
++                image_meta_u = {'properties': {'cache_raw_status': 'Error',
++                                               'cache_raw_error': err}}
++                _safe_update_image_metadata(admin_context,
++                                            image_meta['id'],
++                                            image_meta_u)
++                LOG.error(_LE("Error resuming caching for image:%(id)s"
++                              " reason: %(reason)s") %
++                          {'id': image_meta['id'],
++                           'reason': encodeutils.exception_to_unicode(e)})
++                # TODO(oponcea): _log_to_fm(err)
++                continue
++            try:
++                LOG.info(_LI("Found image that is not cached: %s "
++                             "enqueuing it for caching") %
++                         image_meta['id'])
++                create_image_cache(admin_context, image_meta['id'])
++            except Exception as e:
++                err = encodeutils.exception_to_unicode(e)
++                image_meta_u = {'properties': {'cache_raw_status': 'Error',
++                                               'cache_raw_error': err}}
++                _safe_update_image_metadata(admin_context,
++                                            image_meta['id'],
++                                            image_meta_u)
++                LOG.error(_LE("Error creating RAW cache for image: "
++                              "%(img)s, err: %(err)s") %
++                          {'img': image_meta['id'], 'err': err})
++                # TODO(oponcea): _log_to_fm(err)
++                continue
++
++    # Start the main loop
++    while True:
++        LOG.info(_LI("RAW caching waiting for request"))
++        try:
++            # multiprocessing.Queue.put() uses a background thread to pickle
++            # and enqueue object to internal queue; yield from current eventlet
++            # to give that thread a chance to run
++            image_id = None
++            while not image_id:
++                eventlet.sleep(0)
++                try:
++                    image_id = g_job_queue.get(True, 5)
++                except Empty:
++                    pass
++            LOG.info(_LI("RAW caching got job for: %s") % image_id)
++        except IOError as e:
++            # Remove the exceptions generated by EINTR from logs
++            if e.errno != errno.EINTR:
++                raise
++            continue
++        try:
++            # Set current caching image
++            with g_delete_lock:
++                # Do not start a new caching if a delete is in progress.
++                # Delete operations are short, this should not take long
++                g_image_id.value = str(image_id)
++            admin_context = _get_context()
++
++            # Do the caching itself
++            _cache_img_to_raw(admin_context, image_id)
++        except Exception as e:
++            # Execution needs to continue even if conversion
++            # errors are encountered
++            LOG.error(traceback.format_exc())
++            err = encodeutils.exception_to_unicode(e)
++            image_meta = {'properties': {'cache_raw_status': 'Error',
++                                         'cache_raw_error': err}}
++            _safe_update_image_metadata(admin_context,
++                                        image_id,
++                                        image_meta)
++        finally:
++            with g_delete_lock:
++                # If delete is waiting for caching to complete tell it
++                # that it's over.
++                g_image_id.value = ""
++                # notify_all as same image may be deleted twice
++                g_delete_lock.notify_all()
++
++
++def _is_caching_needed(m):
++    """Check if image should be cached or not
++
++    :param m: the meta-data dictionary of an image
++    :return: False if it's not ok to cache or already cached
++             True if is good to cache or previous caching failed
++    """
++    # Check main status and format
++    if m['status'] != 'active' or m['disk_format'] == 'raw':
++        return False
++
++    # Check the caching properties
++    p = m.get('properties', {})
++    if p.get('cache_raw', '') == 'True':
++        cache_raw_status = p.get('cache_raw_status', '')
++        if cache_raw_status != 'Cached':
++            return True  # we retry the conversion if the image is in Error
++        return False
++    return False
++
++
++def create_image_cache(context, image_id):
++    """Enqueue an image for caching if needed"""
++    global g_job_queue, g_is_cache_raw_enabled
++    if not g_is_cache_raw_enabled or not g_is_cache_raw_enabled.value:
++        # Check & delete image cache only if RAW Caching is enabled
++        # Note: UTs should pass without modifications
++        return
++    image_meta = registry.get_image_metadata(context, image_id)
++    if not _is_caching_needed(image_meta):
++        LOG.info(_LE("Caching not needed for:%s") % image_id)
++        return
++
++    # Schedule image for caching only if RAW Caching is enabled
++    if not g_is_cache_raw_enabled.value:
++        del image_meta['properties']['cache_raw']
++        registry.update_image_metadata(context, image_id, image_meta,
++                                       purge_props=True)
++        return
++
++    # Make sure we have all of the fields and that they are correctly set
++    image_meta['properties']['cache_raw_status'] = 'Queued'
++    image_meta['properties']['cache_raw_size'] = '-'
++    if 'cache_raw_error' in image_meta['properties']:
++        del image_meta['properties']['cache_raw_error']
++    registry.update_image_metadata(context, image_id, image_meta,
++                                   purge_props=True)
++
++    LOG.info(_LI("Enqueuing image for conversion: %s") % image_id)
++    g_job_queue.put(image_id)
++
++
++def delete_image_cache(context, image_id, image_meta=None):
++    """Deleting an image from cache"""
++    global g_image_id, g_done_event, g_delete_lock, g_is_cache_raw_enabled
++    if not g_is_cache_raw_enabled or not g_is_cache_raw_enabled.value:
++        # Check & delete image cache only if RAW Caching is enabled
++        # Note: UTs pass should pass without modifications
++        return
++    LOG.info(_LI("Deleting image %s from cache") % image_id)
++    # Check if we are caching, race issues with cache_raw_status in the meta
++    # so don't rely on it
++    with g_delete_lock:
++        if g_image_id.value == image_id:
++            # We can't delete an image that it's caching.
++            LOG.info(_LI("Image %s is caching, waiting for operation to "
++                         "complete before deleting it") % image_id)
++            g_delete_lock.wait(1200)  # wait for caching to complete
++            image_meta = registry.get_image_metadata(context, image_id)
++    if not image_meta:
++        # Glance V2 API is providing a different metadata format,
++        # therefore cannot be reused
++        image_meta = registry.get_image_metadata(context, image_id)
++    url = image_meta['properties'].get('cache_raw_url')
++    if url:
++        _del_rbd_image(url, image_meta['id'])
++
++
++def _sig_handler(signum, frame):
++    LOG.info(_LI("Signal handler called with signal %s") % signum)
++    if signum in [signal.SIGTERM]:
++        LOG.info(_LI("Exiting RAW Caching due to signal"))
++        signal.signal(signum, signal.SIG_IGN)
++        os._exit(0)
++    # We are ignoring SIGHUP and SIGUSR1.
++    # SIGHUP is used for configuration reload, and RAW caching does not
++    # support it and SIGUSR1 is converted into a SIGTERM when the time
++    # is right by the main process
++    LOG.info(_LI("Ignoring signal %s") % signum)
+diff --git a/glance/cmd/api.py b/glance/cmd/api.py
+index 48d431c..4e038a7 100644
+--- a/glance/cmd/api.py
++++ b/glance/cmd/api.py
+@@ -45,6 +45,7 @@ from oslo_config import cfg
+ from oslo_log import log as logging
+ import osprofiler.initializer
+ 
++from glance import cache_raw
+ from glance.common import config
+ from glance.common import exception
+ from glance.common import wsgi
+@@ -75,6 +76,11 @@ def main():
+         logging.setup(CONF, 'glance')
+         notifier.set_defaults()
+ 
++        # Shared data need to be initialized prior to fork()
++        # so we need this before WSGI initialization in case it is
++        # configured to use it
++        cache_raw.initialize()
++
+         if CONF.profiler.enabled:
+             osprofiler.initializer.init_from_conf(
+                 conf=CONF,
+@@ -86,7 +92,10 @@ def main():
+ 
+         server = wsgi.Server(initialize_glance_store=True)
+         server.start(config.load_paste_app('glance-api'), default_port=9292)
+-        server.wait()
++        # Start RAW caching
++        p = cache_raw.start_raw_caching(server)
++        server.wait(p)
++
+     except KNOWN_EXCEPTIONS as e:
+         fail(e)
+ 
+diff --git a/glance/common/exception.py b/glance/common/exception.py
+index 097957a..8b9ab32 100644
+--- a/glance/common/exception.py
++++ b/glance/common/exception.py
+@@ -452,6 +452,30 @@ class MetadefTagNotFound(NotFound):
+                 " namespace=%(namespace_name)s.")
+ 
+ 
++class CachingToRawException(GlanceException):
++    message = _("Error caching image to RAW: %(reason)s")
++
++
++class ImageUnacceptable(CachingToRawException):
++    message = _("Image %(image_id)s is unacceptable: %(reason)s")
++
++
++class ConvertToSameFormat(CachingToRawException):
++    message = _("Source and destination files have the same format: %(fmt)s")
++
++    def __init__(self, message=None, *args, **kwargs):
++        self.fmt = kwargs.get("fmt")
++        super(ConvertToSameFormat, self).__init__(message, *args, **kwargs)
++
++
++class ImageUncacheable(CachingToRawException):
++    message = _("Image %(image_id)s is uncacheable: %(reason)s")
++
++
++class InvalidRbdUrl(CachingToRawException):
++    message = _("Provided url is not RBD valid: %(url)s")
++
++
+ class InvalidDataMigrationScript(GlanceException):
+     message = _("Invalid data migration script '%(script)s'. A valid data "
+                 "migration script must implement functions 'has_migrations' "
+diff --git a/glance/common/imageutils.py b/glance/common/imageutils.py
+new file mode 100644
+index 0000000..79a7277
+--- /dev/null
++++ b/glance/common/imageutils.py
+@@ -0,0 +1,157 @@
++# Copyright 2010 United States Government as represented by the
++# Administrator of the National Aeronautics and Space Administration.
++# All Rights Reserved.
++# Copyright (c) 2010 Citrix Systems, Inc.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""
++Helper methods to deal with images.
++
++Adapted by WRS from Cinder (cinder/openstack/common/imageutils.py)
++Note: to remove in Liberty (present in oslo_utils)
++"""
++
++import re
++
++from oslo_utils import strutils
++
++from glance import i18n
++
++_ = i18n._
++
++
++class QemuImgInfo(object):
++    BACKING_FILE_RE = re.compile((r"^(.*?)\s*\(actual\s+path\s*:"
++                                  r"\s+(.*?)\)\s*$"), re.I)
++    TOP_LEVEL_RE = re.compile(r"^([\w\d\s\_\-]+):(.*)$")
++    SIZE_RE = re.compile(r"(\d*\.?\d+)(\w+)?(\s*\(\s*(\d+)\s+bytes\s*\))?",
++                         re.I)
++
++    def __init__(self, cmd_output=None):
++        details = self._parse(cmd_output or '')
++        self.image = details.get('image')
++        self.backing_file = details.get('backing_file')
++        self.file_format = details.get('file_format')
++        self.virtual_size = details.get('virtual_size')
++        self.cluster_size = details.get('cluster_size')
++        self.disk_size = details.get('disk_size')
++        self.snapshots = details.get('snapshot_list', [])
++        self.encrypted = details.get('encrypted')
++
++    def __str__(self):
++        lines = [
++            'image: %s' % self.image,
++            'file_format: %s' % self.file_format,
++            'virtual_size: %s' % self.virtual_size,
++            'disk_size: %s' % self.disk_size,
++            'cluster_size: %s' % self.cluster_size,
++            'backing_file: %s' % self.backing_file,
++        ]
++        if self.snapshots:
++            lines.append("snapshots: %s" % self.snapshots)
++        if self.encrypted:
++            lines.append("encrypted: %s" % self.encrypted)
++        return "\n".join(lines)
++
++    def _canonicalize(self, field):
++        # Standardize on underscores/lc/no dash and no spaces
++        # since qemu seems to have mixed outputs here... and
++        # this format allows for better integration with python
++        # - i.e. for usage in kwargs and such...
++        field = field.lower().strip()
++        for c in (" ", "-"):
++            field = field.replace(c, '_')
++        return field
++
++    def _extract_bytes(self, details):
++        # Replace it with the byte amount
++        real_size = self.SIZE_RE.search(details)
++        if not real_size:
++            raise ValueError(_('Invalid input value "%s".') % details)
++        magnitude = real_size.group(1)
++        unit_of_measure = real_size.group(2)
++        bytes_info = real_size.group(3)
++        if bytes_info:
++            return int(real_size.group(4))
++        elif not unit_of_measure:
++            return int(magnitude)
++        return strutils.string_to_bytes('%s%sB' % (magnitude, unit_of_measure),
++                                        return_int=True)
++
++    def _extract_details(self, root_cmd, root_details, lines_after):
++        real_details = root_details
++        if root_cmd == 'backing_file':
++            # Replace it with the real backing file
++            backing_match = self.BACKING_FILE_RE.match(root_details)
++            if backing_match:
++                real_details = backing_match.group(2).strip()
++        elif root_cmd in ['virtual_size', 'cluster_size', 'disk_size']:
++            # Replace it with the byte amount (if we can convert it)
++            if root_details == 'None':
++                real_details = 0
++            else:
++                real_details = self._extract_bytes(root_details)
++        elif root_cmd == 'file_format':
++            real_details = real_details.strip().lower()
++        elif root_cmd == 'snapshot_list':
++            # Next line should be a header, starting with 'ID'
++            if not lines_after or not lines_after.pop(0).startswith("ID"):
++                msg = _("Snapshot list encountered but no header found!")
++                raise ValueError(msg)
++            real_details = []
++            # This is the sprintf pattern we will try to match
++            # "%-10s%-20s%7s%20s%15s"
++            # ID TAG VM SIZE DATE VM CLOCK (current header)
++            while lines_after:
++                line = lines_after[0]
++                line_pieces = line.split()
++                if len(line_pieces) != 6:
++                    break
++                # Check against this pattern in the final position
++                # "%02d:%02d:%02d.%03d"
++                date_pieces = line_pieces[5].split(":")
++                if len(date_pieces) != 3:
++                    break
++                lines_after.pop(0)
++                real_details.append({
++                    'id': line_pieces[0],
++                    'tag': line_pieces[1],
++                    'vm_size': line_pieces[2],
++                    'date': line_pieces[3],
++                    'vm_clock': line_pieces[4] + " " + line_pieces[5],
++                })
++        return real_details
++
++    def _parse(self, cmd_output):
++        # Analysis done of qemu-img.c to figure out what is going on here
++        # Find all points start with some chars and then a ':' then a newline
++        # and then handle the results of those 'top level' items in a separate
++        # function.
++        #
++        # TODO(harlowja): newer versions might have a json output format
++        #                 we should switch to that whenever possible.
++        #                 see: http://bit.ly/XLJXDX
++        contents = {}
++        lines = [x for x in cmd_output.splitlines() if x.strip()]
++        while lines:
++            line = lines.pop(0)
++            top_level = self.TOP_LEVEL_RE.match(line)
++            if top_level:
++                root = self._canonicalize(top_level.group(1))
++                if not root:
++                    continue
++                root_details = top_level.group(2).strip()
++                details = self._extract_details(root, root_details, lines)
++                contents[root] = details
++        return contents
+diff --git a/glance/common/wsgi.py b/glance/common/wsgi.py
+index 26e5f6f..ebe13e8 100644
+--- a/glance/common/wsgi.py
++++ b/glance/common/wsgi.py
+@@ -458,6 +458,7 @@ class Server(object):
+         self._logger = logging.getLogger("eventlet.wsgi.server")
+         self.threads = threads
+         self.children = set()
++        self.raw_caching_pid = None
+         self.stale_children = set()
+         self.running = True
+         # NOTE(abhishek): Allows us to only re-initialize glance_store when
+@@ -531,6 +532,9 @@ class Server(object):
+         elif pid in self.stale_children:
+             self.stale_children.remove(pid)
+             LOG.info(_LI('Removed stale child %s'), pid)
++        elif pid == self.raw_caching_pid:
++            LOG.info(_LI('RAW caching child died %s'), pid)
++            self.raw_caching_pid = -1
+         else:
+             LOG.warn(_LW('Unrecognised child %s') % pid)
+ 
+@@ -547,6 +551,10 @@ class Server(object):
+         else:
+             if len(self.children) < get_num_workers():
+                 self.run_child()
++        if self.raw_caching_pid is not None and self.raw_caching_pid < 0:
++            LOG.error(_LE('Not respawning raw_caching child %d, cannot '
++                          'recover from termination') % self.raw_caching_pid)
++            self.running = False
+ 
+     def wait_on_children(self):
+         while self.running:
+@@ -603,6 +611,9 @@ class Server(object):
+         self.stale_children = self.children
+         self.children = set()
+ 
++        if self.raw_caching_pid:
++            LOG.warn(_LW('RAW Caching does not support configuration reload'))
++
+         # Ensure any logging config changes are picked up
+         logging.setup(CONF, 'glance')
+         config.set_config_defaults()
+@@ -610,8 +621,10 @@ class Server(object):
+         self.configure(old_conf, has_changed)
+         self.start_wsgi()
+ 
+-    def wait(self):
++    def wait(self, raw_caching_pid=None):
+         """Wait until all servers have completed running."""
++        if raw_caching_pid:
++            self.raw_caching_pid = raw_caching_pid
+         try:
+             if self.children:
+                 self.wait_on_children()
+diff --git a/glance/tests/integration/legacy_functional/test_v1_api.py b/glance/tests/integration/legacy_functional/test_v1_api.py
+index a589591..887462e 100644
+--- a/glance/tests/integration/legacy_functional/test_v1_api.py
++++ b/glance/tests/integration/legacy_functional/test_v1_api.py
+@@ -15,13 +15,17 @@ import hashlib
+ import os
+ import tempfile
+ 
++import mock
++
+ from oslo_serialization import jsonutils
+ from oslo_utils import units
+ from six.moves import http_client
+ import testtools
+ 
++from glance.api.v1 import images
+ from glance.common import timeutils
+ from glance.tests.integration.legacy_functional import base
++from glance.tests.unit import fake_cache_raw
+ from glance.tests.utils import minimal_headers
+ 
+ FIVE_KB = 5 * units.Ki
+@@ -29,7 +33,10 @@ FIVE_GB = 5 * units.Gi
+ 
+ 
+ class TestApi(base.ApiTest):
+-    def test_get_head_simple_post(self):
++    @mock.patch.object(images, 'cache_raw')
++    def test_get_head_simple_post(self, mock_cache_raw):
++        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
++
+         # 0. GET /images
+         # Verify no public images
+         path = "/v1/images"
+@@ -220,7 +227,8 @@ class TestApi(base.ApiTest):
+         response, content = self.http.request(path, 'DELETE')
+         self.assertEqual(http_client.OK, response.status)
+ 
+-    def test_queued_process_flow(self):
++    @mock.patch.object(images, 'cache_raw')
++    def test_queued_process_flow(self, mock_cache_raw):
+         """
+         We test the process flow where a user registers an image
+         with Glance but does not immediately upload an image file.
+@@ -243,6 +251,7 @@ class TestApi(base.ApiTest):
+         6. GET /images
+         - Verify one public image
+         """
++        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
+ 
+         # 0. GET /images
+         # Verify no public images
+@@ -729,10 +738,12 @@ class TestApi(base.ApiTest):
+         self.assertEqual(http_client.BAD_REQUEST, response.status)
+         self.assertIn("is_public got imalittleteapot", content)
+ 
+-    def test_limited_images(self):
++    @mock.patch.object(images, 'cache_raw')
++    def test_limited_images(self, mock_cache_raw):
+         """
+         Ensure marker and limit query params work
+         """
++        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
+ 
+         # 0. GET /images
+         # Verify no public images
+@@ -817,10 +828,13 @@ class TestApi(base.ApiTest):
+             response, content = self.http.request(path, 'DELETE')
+             self.assertEqual(http_client.OK, response.status)
+ 
+-    def test_ordered_images(self):
++    @mock.patch.object(images, 'cache_raw')
++    def test_ordered_images(self, mock_cache_raw):
+         """
+         Set up three test images and ensure each query param filter works
+         """
++        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
++
+         # 0. GET /images
+         # Verify no public images
+         path = "/v1/images"
+@@ -1300,7 +1314,10 @@ class TestApiWithFakeAuth(base.ApiTest):
+         for image in images:
+             self.assertFalse(image['is_public'])
+ 
+-    def test_property_protections(self):
++    @mock.patch.object(images, 'cache_raw')
++    def test_property_protections(self, mock_cache_raw):
++        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
++
+         # Enable property protection
+         self.config(property_protection_file=self.property_file)
+         self.init()
+diff --git a/glance/tests/unit/fake_cache_raw.py b/glance/tests/unit/fake_cache_raw.py
+new file mode 100644
+index 0000000..08f664b
+--- /dev/null
++++ b/glance/tests/unit/fake_cache_raw.py
+@@ -0,0 +1,27 @@
++# Copyright (c) 2013-2015 Wind River Systems, Inc.
++#
++# SPDX-License-Identifier: Apache-2.0
++#
++#
++#
++
++# vim: tabstop=4 shiftwidth=4 softtabstop=4
++
++# All Rights Reserved.
++#
++
++
++def initialize():
++    pass
++
++
++def create_image_cache(context, image_id):
++    pass
++
++
++def delete_image_cache(context, image_id, image_meta=None):
++    pass
++
++
++def start_raw_caching():
++    pass
+diff --git a/glance/tests/unit/v1/test_api.py b/glance/tests/unit/v1/test_api.py
+index e2fc652..95a5162 100644
+--- a/glance/tests/unit/v1/test_api.py
++++ b/glance/tests/unit/v1/test_api.py
+@@ -33,6 +33,7 @@ import webob
+ 
+ import glance.api
+ import glance.api.common
++from glance.api.v1 import images
+ from glance.api.v1 import router
+ from glance.api.v1 import upload_utils
+ import glance.common.config
+@@ -43,6 +44,7 @@ from glance.db.sqlalchemy import api as db_api
+ from glance.db.sqlalchemy import models as db_models
+ import glance.registry.client.v1.api as registry
+ from glance.tests.unit import base
++from glance.tests.unit import fake_cache_raw
+ from glance.tests.unit import fake_rados
+ import glance.tests.unit.utils as unit_test_utils
+ from glance.tests import utils as test_utils
+@@ -1540,8 +1542,11 @@ class TestGlanceAPI(base.IsolatedUnitTest):
+         res = req.get_response(self.api)
+         self.assertEqual(http_client.FORBIDDEN, res.status_int)
+ 
+-    def test_update_deleted_image(self):
++    @mock.patch.object(images, 'cache_raw')
++    def test_update_deleted_image(self, mock_cache_raw):
+         """Tests that exception raised trying to update a deleted image"""
++        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
++
+         req = webob.Request.blank("/images/%s" % UUID2)
+         req.method = 'DELETE'
+         res = req.get_response(self.api)
+@@ -1557,8 +1562,11 @@ class TestGlanceAPI(base.IsolatedUnitTest):
+         self.assertEqual(http_client.FORBIDDEN, res.status_int)
+         self.assertIn(b'Forbidden to update deleted image', res.body)
+ 
+-    def test_delete_deleted_image(self):
++    @mock.patch.object(images, 'cache_raw')
++    def test_delete_deleted_image(self, mock_cache_raw):
+         """Tests that exception raised trying to delete a deleted image"""
++        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
++
+         req = webob.Request.blank("/images/%s" % UUID2)
+         req.method = 'DELETE'
+         res = req.get_response(self.api)
+@@ -1585,10 +1593,12 @@ class TestGlanceAPI(base.IsolatedUnitTest):
+         self.assertEqual(http_client.OK, res.status_int)
+         self.assertEqual("deleted", res.headers['x-image-meta-status'])
+ 
+-    def test_image_status_when_delete_fails(self):
++    @mock.patch.object(images, 'cache_raw')
++    def test_image_status_when_delete_fails(self, mock_cache_raw):
+         """
+         Tests that the image status set to active if deletion of image fails.
+         """
++        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
+ 
+         fs = store.get_store_from_scheme('file')
+ 
+@@ -1953,10 +1963,11 @@ class TestGlanceAPI(base.IsolatedUnitTest):
+ 
+         self.assertEqual(1, mock_store_add_to_backend.call_count)
+ 
++    @mock.patch.object(images, 'cache_raw')
+     @mock.patch.object(upload_utils, 'rbd')
+     @mock.patch('glance_store.store_add_to_backend')
+     def test_upload_safe_kill_deleted(self, mock_store_add_to_backend,
+-                                      mock_rbd):
++                                      mock_rbd, mock_cache_raw):
+         test_router_api = router.API(self.mapper)
+         self.api = test_utils.FakeAuthMiddleware(test_router_api,
+                                                  is_admin=True)
+@@ -1982,6 +1993,7 @@ class TestGlanceAPI(base.IsolatedUnitTest):
+             raise Exception("== UNIT TEST UPLOAD EXCEPTION ==")
+ 
+         mock_rbd.NoSpace = fake_rados.mock_rbd.NoSpace
++        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
+ 
+         mocks = [{'mock': mock_store_add_to_backend,
+                  'side_effect': mock_store_add_to_backend_w_exception}]
+@@ -2072,10 +2084,14 @@ class TestGlanceAPI(base.IsolatedUnitTest):
+         self.assertEqual('True', res.headers['x-image-meta-deleted'])
+         self.assertEqual('deleted', res.headers['x-image-meta-status'])
+ 
+-    def test_delete_during_image_upload_by_normal_user(self):
++    @mock.patch.object(images, 'cache_raw')
++    def test_delete_during_image_upload_by_normal_user(self, mock_cache_raw):
++        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
+         self._check_delete_during_image_upload(is_admin=False)
+ 
+-    def test_delete_during_image_upload_by_admin(self):
++    @mock.patch.object(images, 'cache_raw')
++    def test_delete_during_image_upload_by_admin(self, mock_cache_raw):
++        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
+         self._check_delete_during_image_upload(is_admin=True)
+ 
+     def test_disable_purge_props(self):
+@@ -2906,7 +2922,9 @@ class TestGlanceAPI(base.IsolatedUnitTest):
+         res = req.get_response(self.api)
+         self.assertEqual(http_client.BAD_REQUEST, res.status_int)
+ 
+-    def test_delete_image(self):
++    @mock.patch.object(images, 'cache_raw')
++    def test_delete_image(self, mock_cache_raw):
++        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
+         req = webob.Request.blank("/images/%s" % UUID2)
+         req.method = 'DELETE'
+         res = req.get_response(self.api)
+@@ -2952,7 +2970,8 @@ class TestGlanceAPI(base.IsolatedUnitTest):
+         self.assertEqual(http_client.OK, res.status_int)
+         self.assertEqual(19, len(res.body))
+ 
+-    def test_delete_queued_image(self):
++    @mock.patch.object(images, 'cache_raw')
++    def test_delete_queued_image(self, mock_cache_raw):
+         """Delete an image in a queued state
+ 
+         Bug #747799 demonstrated that trying to DELETE an image
+@@ -2967,6 +2986,8 @@ class TestGlanceAPI(base.IsolatedUnitTest):
+                            'x-image-meta-container-format': 'ovf',
+                            'x-image-meta-name': 'fake image #3'}
+ 
++        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
++
+         req = webob.Request.blank("/images")
+         req.method = 'POST'
+         for k, v in six.iteritems(fixture_headers):
+@@ -2990,7 +3011,8 @@ class TestGlanceAPI(base.IsolatedUnitTest):
+         self.assertEqual('True', res.headers['x-image-meta-deleted'])
+         self.assertEqual('deleted', res.headers['x-image-meta-status'])
+ 
+-    def test_delete_queued_image_delayed_delete(self):
++    @mock.patch.object(images, 'cache_raw')
++    def test_delete_queued_image_delayed_delete(self, mock_cache_raw):
+         """Delete an image in a queued state when delayed_delete is on
+ 
+         Bug #1048851 demonstrated that the status was not properly
+@@ -3002,6 +3024,8 @@ class TestGlanceAPI(base.IsolatedUnitTest):
+                            'x-image-meta-container-format': 'ovf',
+                            'x-image-meta-name': 'fake image #3'}
+ 
++        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
++
+         req = webob.Request.blank("/images")
+         req.method = 'POST'
+         for k, v in six.iteritems(fixture_headers):
+@@ -3464,10 +3488,13 @@ class TestGlanceAPI(base.IsolatedUnitTest):
+         res = req.get_response(self.api)
+         self.assertEqual(webob.exc.HTTPNoContent.code, res.status_int)
+ 
+-    def test_get_members_of_deleted_image_raises_404(self):
++    @mock.patch.object(images, 'cache_raw')
++    def test_get_members_of_deleted_image_raises_404(self, mock_cache_raw):
+         """
+         Tests members listing for deleted image raises 404.
+         """
++        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
++
+         req = webob.Request.blank("/images/%s" % UUID2)
+         req.method = 'DELETE'
+         res = req.get_response(self.api)
+@@ -3481,10 +3508,13 @@ class TestGlanceAPI(base.IsolatedUnitTest):
+         self.assertIn('Image with identifier %s has been deleted.' % UUID2,
+                       res.body.decode())
+ 
+-    def test_delete_member_of_deleted_image_raises_404(self):
++    @mock.patch.object(images, 'cache_raw')
++    def test_delete_member_of_deleted_image_raises_404(self, mock_cache_raw):
+         """
+         Tests deleting members of deleted image raises 404.
+         """
++        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
++
+         test_router = router.API(self.mapper)
+         self.api = test_utils.FakeAuthMiddleware(test_router, is_admin=True)
+         req = webob.Request.blank("/images/%s" % UUID2)
+@@ -3500,10 +3530,13 @@ class TestGlanceAPI(base.IsolatedUnitTest):
+         self.assertIn('Image with identifier %s has been deleted.' % UUID2,
+                       res.body.decode())
+ 
+-    def test_update_members_of_deleted_image_raises_404(self):
++    @mock.patch.object(images, 'cache_raw')
++    def test_update_members_of_deleted_image_raises_404(self, mock_cache_raw):
+         """
+         Tests update members of deleted image raises 404.
+         """
++        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
++
+         test_router = router.API(self.mapper)
+         self.api = test_utils.FakeAuthMiddleware(test_router, is_admin=True)
+ 
+@@ -3609,10 +3642,13 @@ class TestGlanceAPI(base.IsolatedUnitTest):
+         memb_list = jsonutils.loads(res.body)['members']
+         self.assertEqual(fixture, memb_list)
+ 
+-    def test_create_member_to_deleted_image_raises_404(self):
++    @mock.patch.object(images, 'cache_raw')
++    def test_create_member_to_deleted_image_raises_404(self, mock_cache_raw):
+         """
+         Tests adding members to deleted image raises 404.
+         """
++        mock_cache_raw.delete_image_cache = fake_cache_raw.delete_image_cache
++
+         test_router = router.API(self.mapper)
+         self.api = test_utils.FakeAuthMiddleware(test_router, is_admin=True)
+         req = webob.Request.blank("/images/%s" % UUID2)
+diff --git a/tox.ini b/tox.ini
+index 5f1fd0f..4b6d34d 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -75,7 +75,7 @@ commands =
+ # E712  comparison to True should be 'if cond is True:' or 'if cond:'
+ # H404  multi line docstring should start with a summary
+ # H405  multi line docstring summary not separated with an empty line
+-ignore = E711,E712,H404,H405
++ignore = E711,E712,H404,H405,H102
+ exclude = .venv,.git,.tox,dist,doc,etc,*glance/locale*,*lib/python*,*egg,build
+ 
+ [hacking]
+-- 
+2.7.4
+

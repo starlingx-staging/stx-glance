@@ -1,0 +1,228 @@
+From daacf1262c73619c8c79d0a7fd73c39ebf3a0a65 Mon Sep 17 00:00:00 2001
+From: Kristine Bujold <kristine.bujold@windriver.com>
+Date: Mon, 14 Dec 2015 11:15:47 -0500
+Subject: [PATCH 01/21] Pike Rebase: Validate image properties
+
+CLI and horizon needs to properly validate values
+hw_wrs_live_migration_max_downtime, hw_wrs_live_migration_timeout on
+image creation. Added property validation to image create and update on
+CLI and GUI
+
+Validate image property sw_wrs_auto_recovery in glance. Verify the valid
+values to be variations of 'True' or 'False' and convert it to 'True' or
+'False' respectively.
+
+Validate wrs properties on image creation when adding properties or
+replacing existing property values for existing images.
+
+(cherry picked from commit 289c5db8927c1685f792b696d0871c541e6ac4b7)
+Signed-off-by: Robert Church <robert.church@windriver.com>
+---
+ glance/api/v1/images.py | 71 +++++++++++++++++++++++++++++++++++++++++++++
+ glance/api/v2/images.py | 77 ++++++++++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 147 insertions(+), 1 deletion(-)
+
+diff --git a/glance/api/v1/images.py b/glance/api/v1/images.py
+index 0b74be8..1b19246 100644
+--- a/glance/api/v1/images.py
++++ b/glance/api/v1/images.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2015 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ """
+ /images endpoint for Glance v1 API
+@@ -140,9 +147,73 @@ def validate_image_meta(req, values):
+                checksum)
+         raise HTTPBadRequest(explanation=msg, request=req)
+ 
++    validate_image_properties(req, values)
++
+     return values
+ 
+ 
++def validate_image_properties(req, values):
++
++    properties = values.get('properties')
++    msg = ''
++
++    if not properties:
++        return
++
++    """
++    validate hw_wrs_live_migration_max_downtime property
++    """
++    prop_value = properties.get('hw_wrs_live_migration_max_downtime')
++    if prop_value:
++        LOG.info(_LI('hw_wrs_live_migration_max_downtime: %s') % prop_value)
++        try:
++            prop_value = int(prop_value)
++        except ValueError:
++            msg = _('hw_wrs_live_migration_max_downtime must be a number'
++                    ' greater than or equal to 100, value: %s') % prop_value
++            raise HTTPBadRequest(explanation=msg, request=req)
++
++        if prop_value < 100:
++            msg = _('hw_wrs_live_migration_max_downtime must be a number'
++                    ' greater than or equal to 100, value: %s') % prop_value
++            raise HTTPBadRequest(explanation=msg, request=req)
++
++    """
++    validate hw_wrs_live_migration_timeout property
++    """
++    prop_value = properties.get('hw_wrs_live_migration_timeout')
++    if prop_value:
++        LOG.info(_LI('hw_wrs_live_migration_timeout: %s') % prop_value)
++        try:
++            prop_value = int(prop_value)
++        except ValueError:
++            msg = _('hw_wrs_live_migration_timeout must be a number '
++                    'between 120 and 800 or 0, value: %s') % prop_value
++            raise HTTPBadRequest(explanation=msg, request=req)
++
++        if prop_value != 0:
++            if prop_value < 120 or prop_value > 800:
++                msg = _('hw_wrs_live_migration_timeout must be a number '
++                        'between 120 and 800 or 0, value: %s') % prop_value
++                raise HTTPBadRequest(explanation=msg, request=req)
++
++    """
++    validate sw_wrs_auto_recovery property
++    """
++    prop_value = properties.get('sw_wrs_auto_recovery')
++    if prop_value:
++        LOG.info(_LI('sw_wrs_auto_recovery: %s') % prop_value)
++        auto_recovery = prop_value.lower()
++        if 'false' == auto_recovery:
++            values['properties']['sw_wrs_auto_recovery'] = 'False'
++        elif 'true' == auto_recovery:
++            values['properties']['sw_wrs_auto_recovery'] = 'True'
++        else:
++            msg = _('sw_wrs_auto_recovery must be True or False, '
++                    'value: %s') % prop_value
++            raise HTTPBadRequest(explanation=msg, request=req)
++
++
+ def redact_loc(image_meta, copy_dict=True):
+     """
+     Create a shallow copy of image meta with 'location' removed
+diff --git a/glance/api/v2/images.py b/glance/api/v2/images.py
+index d464c79..f43525d 100644
+--- a/glance/api/v2/images.py
++++ b/glance/api/v2/images.py
+@@ -34,7 +34,7 @@ from glance.common import utils
+ from glance.common import wsgi
+ import glance.db
+ import glance.gateway
+-from glance.i18n import _, _LW
++from glance.i18n import _, _LI, _LW
+ import glance.notifier
+ import glance.schema
+ 
+@@ -62,6 +62,9 @@ class ImagesController(object):
+         image_factory = self.gateway.get_image_factory(req.context)
+         image_repo = self.gateway.get_repo(req.context)
+         try:
++            # WRS: FIXME: Refactor the property validation to fit with schema
++            # methodology
++            self._validate_image_properties(req, extra_properties)
+             image = image_factory.new_image(extra_properties=extra_properties,
+                                             tags=tags, **image)
+             image_repo.add(image)
+@@ -88,6 +91,70 @@ class ImagesController(object):
+ 
+         return image
+ 
++    # WRS: FIXME: Refactor the property validation to fit with schema
++    # methodology
++    def _validate_image_properties(self, req, properties):
++        if not properties:
++            return
++
++        """
++        validate hw_wrs_live_migration_max_downtime property
++        """
++        prop_value = properties.get('hw_wrs_live_migration_max_downtime')
++        if prop_value:
++            LOG.info(_LI('hw_wrs_live_migration_max_downtime: %s') %
++                     prop_value)
++            try:
++                prop_value = int(prop_value)
++            except ValueError:
++                msg = _('hw_wrs_live_migration_max_downtime must '
++                        'be a number greater than or equal to '
++                        '100, value: %s') % prop_value
++                raise webob.exc.HTTPBadRequest(explanation=msg, request=req)
++
++            if prop_value < 100:
++                msg = _('hw_wrs_live_migration_max_downtime must '
++                        'be a number greater than or equal to '
++                        '100, value: %s') % prop_value
++                raise webob.exc.HTTPBadRequest(explanation=msg, request=req)
++
++        """
++        validate hw_wrs_live_migration_timeout property
++        """
++        prop_value = properties.get('hw_wrs_live_migration_timeout')
++        if prop_value:
++            LOG.info(_LI('hw_wrs_live_migration_timeout: %s') % prop_value)
++            try:
++                prop_value = int(prop_value)
++            except ValueError:
++                msg = _('hw_wrs_live_migration_timeout must be a number '
++                        'between 120 and 800 or 0, value: %s') % prop_value
++                raise webob.exc.HTTPBadRequest(explanation=msg, request=req)
++
++            if prop_value != 0:
++                if prop_value < 120 or prop_value > 800:
++                    msg = _('hw_wrs_live_migration_timeout must '
++                            'be a number between 120 and 800 or 0,'
++                            ' value: %s') % prop_value
++                    raise webob.exc.HTTPBadRequest(explanation=msg,
++                                                   request=req)
++
++        """
++        validate sw_wrs_auto_recovery property
++        """
++        prop_value = properties.get('sw_wrs_auto_recovery')
++        if prop_value:
++            LOG.info(_LI('sw_wrs_auto_recovery: %s') % prop_value)
++            auto_recovery = prop_value.lower()
++            if 'false' == auto_recovery:
++                properties['sw_wrs_auto_recovery'] = 'False'
++            elif 'true' == auto_recovery:
++                properties['sw_wrs_auto_recovery'] = 'True'
++            else:
++                msg = _('sw_wrs_auto_recovery must be True or False, '
++                        'value: %s') % prop_value
++                raise webob.exc.HTTPBadRequest(explanation=msg, request=req)
++
+     @utils.mutating
+     def import_image(self, req, image_id, body):
+         task_factory = self.gateway.get_task_factory(req.context)
+@@ -170,6 +237,14 @@ class ImagesController(object):
+ 
+     @utils.mutating
+     def update(self, req, image_id, changes):
++        # WRS: FIXME: Refactor the property validation to fit with schema
++        # methodology
++        properties = {}
++        for change in changes:
++            if change['op'] in ['add', 'replace']:
++                properties.update({change['path'][0]: change['value']})
++        self._validate_image_properties(req, properties)
++
+         image_repo = self.gateway.get_repo(req.context)
+         try:
+             image = image_repo.get(image_id)
+-- 
+2.7.4
+

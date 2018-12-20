@@ -1,0 +1,357 @@
+From 6aa614c77c9a5d2cab44c71ea979520bf6c59898 Mon Sep 17 00:00:00 2001
+From: Ovidiu Poncea <ovidiu.poncea@windriver.com>
+Date: Wed, 31 May 2017 16:47:59 +0300
+Subject: [PATCH 09/21] Pike Rebase: Update metadefs
+
+Add Nova Live Migration params to metadefs
+
+Add minimum of 100 to hw_wrs_live_migration_max_downtime
+metadef
+
+Horizon: Remove live migration parms from edit image panel
+
+Modifying metadatadef in glance to work with pattern validation
+
+Horizon: Remove live migration parms from edit image panel
+
+Introducing auto-recovery to glance metadata
+
+Correct syntax for Live Migration in instance metadata
+in Horizon
+
+Create different namespaces for instance metadata and image metadata.
+Correct syntax in instance metadata.
+
+Update in Horizon default value for Live Migration Timeout
+
+Change default value for Live Migration Timeout from 800 to 180.
+
+Note that this commit also corrected the match pattern of
+live_migration_timeout for instance and image metadata.
+
+Convert Titanium Server and TiS to Titanium Cloud
+
+Add ability to recover VMs in priority order
+
+Adding that ability to recover VMs in priority order. Changes
+in glance include:
+- Definition of instance metadata in glance so it can be selected
+  from horizon (use update metadata for an instance).
+
+Change display name for WRS metadata
+
+Changing the display name for WRS specific image and instance
+metadata so it says WRS instead of "Titanium Cloud".
+
+Deprecate/Remove Flavor extra specs tab in Horizon
+
+  - add compute-tis-flavor.json for WRS nova flavor options
+  - add enum list to memory_page_size properties (guest-memory-backing)
+
+Deprecate/Remove Flavor extra specs tab in Horizon
+
+  - fix typo and desccription for WRS Flavor Options
+
+Deprecate/Remove Flavor extra specs tab in Horizon
+
+  - fix syntax error (missing bracket)
+
+GPU passthrough
+
+For GPU passthough, PCI aliases were added for gpu, gpu-pf, and gpu-vf.
+Another alias 'user' enables a user to passthrough any PCI device, such
+as a USB mouse, keyboard, etc.
+
+This commit modifies the PCI alias regex to support an arbitrary
+name, rather than restricted to qat-vf only.
+
+Support for vxWorks7 guest - add HPET timer support
+
+This commit adds support for the HPET Timer needed by VxWorks guests.
+Added "Guest HPET support" to WRS flavor  extraspecs.
+When this extra-spec is used The HPET timer is activated in libvirt
+
+---
+ etc/metadefs/compute-guest-memory-backing.json |  12 ++-
+ etc/metadefs/compute-tis-flavor.json           | 127 +++++++++++++++++++++++++
+ etc/metadefs/tis-live-migration-image.json     |  35 +++++++
+ etc/metadefs/tis-live-migration-instance.json  |  36 +++++++
+ etc/metadefs/tis-recovery-instance.json        |  24 +++++
+ 5 files changed, 232 insertions(+), 2 deletions(-)
+ create mode 100644 etc/metadefs/compute-tis-flavor.json
+ create mode 100755 etc/metadefs/tis-live-migration-image.json
+ create mode 100755 etc/metadefs/tis-live-migration-instance.json
+ create mode 100755 etc/metadefs/tis-recovery-instance.json
+
+diff --git a/etc/metadefs/compute-guest-memory-backing.json b/etc/metadefs/compute-guest-memory-backing.json
+index f0e4e68..3483f4b 100644
+--- a/etc/metadefs/compute-guest-memory-backing.json
++++ b/etc/metadefs/compute-guest-memory-backing.json
+@@ -23,7 +23,15 @@
+         "mem_page_size": {
+             "title": "Size of memory page",
+             "description": "Page size to be used for Guest memory backing. Value can be specified as <number><unit> (i.e.: 2MB, 1GB) or 'any', 'small', 'large'. If this property is set in Image metadata then only 'any' and 'large' values are accepted in Flavor metadata by Nova API.",
+-            "type": "string"
++            "type": "string",
++            "enum": [
++                "small",
++                "large",
++                "any",
++                "2048",
++                "1048576"
++            ],
++            "default": "2048"
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/etc/metadefs/compute-tis-flavor.json b/etc/metadefs/compute-tis-flavor.json
+new file mode 100644
+index 0000000..1f93e85
+--- /dev/null
++++ b/etc/metadefs/compute-tis-flavor.json
+@@ -0,0 +1,127 @@
++{
++    "namespace": "OS::Compute::TiSFlavor",
++    "display_name": "WRS Flavor Options",
++    "description": "WRS options for Flavors may be used to customize and manage Nova Flavors.",
++    "visibility": "public",
++    "protected": true,
++    "resource_type_associations": [
++        {
++            "name": "OS::Nova::Flavor"
++        }
++    ],
++    "properties": {
++        "pci_passthrough:alias": {
++            "title": "PCI Alias",
++            "description": "Specifies the number of PCI devices that are exposed for VM use. The value must be in the form of name:n, where name is the alphanumeric name of the PCI alias and n is the number of devices starting from 1",
++            "type": "string",
++            "pattern": "^[a-zA-Z-0-9]*:[0-9](?:,[\\s]*[a-zA-Z-0-9]*:[0-9])*$",
++            "default": "qat-vf:1"
++        },
++        "aggregate_instance_extra_specs:storage": {
++            "title": "Storage Type",
++            "description": "Specifies how storage is instantiated for ephemeral and swap disks, and for the instance boot image if used.",
++            "type": "string",
++            "enum": [
++                "remote",
++                "local_lvm",
++                "local_image"
++            ],
++            "default": "local_image"
++        },
++        "hw:cpu_model": {
++            "title": "VCPU Model",
++            "description": "select a particular VCPU model for a VM in order to leverage advanced CPU features such as SSE4.2, AES, or AVX on the compute nodes.",
++            "type": "string",
++            "enum": [
++                "Nehalem",
++                "Westmere",
++                "SandyBridge",
++                "Haswell",
++                "Broadwell-noTSX",
++                "Broadwell",
++                "Skylake-Client",
++                "Passthrough",
++                "Conroe"
++            ],
++            "default": "Nehalem"
++        },
++        "hw:numa_nodes": {
++            "title": "Number of NUMA Nodes",
++            "description": "Sets the number of virtual NUMA Nodes.",
++            "type": "integer",
++            "minimum": 1,
++            "maximum": 4,
++            "default": 1
++        },
++        "hw:wrs:min_vcpus": {
++            "title": "Minimum Number of CPUs",
++            "description": "Sets the minimum number of virtual CPUs for the flavor to support CPU scaling.",
++            "type": "integer",
++            "minimum": 1,
++            "maximum": 128,
++            "default": 1
++        },
++        "hw:wrs:shared_vcpu": {
++            "title": "Shared VCPU ID",
++            "description": "Specifies the ID of a virtual CPU scheduled to run on a shared physical CPU in the compute host.",
++            "type": "integer",
++            "minimum": 0,
++            "maximum": 127,
++            "default": 0
++        },
++        "hw:wrs:vswitch_numa_affinity": {
++            "title": "vSwitch NUMA Affinity",
++            "description": "Specifies that a NUMA node with a vSwitch core is required or preferred when instantiating the VM.",
++            "type": "string",
++            "enum": [
++                "strict",
++                "prefer"
++            ],
++            "default": "prefer" 
++        },
++        "hw:wrs:live_migration_timeout": {
++            "title": "Live Migration Timeout",
++            "type": "string",
++            "pattern": "^0$|^(1[2-9][0-9]|[2-7]\\d\\d)$|^800$",
++            "default": "180",
++            "description": "The maximum time allowed for live migration. Set to 0 to disable timeout. If unspecified this value defaults to 180 seconds. The value should be in range [120, 800] or 0."
++        },
++        "hw:wrs:live_migration_max_downtime": {
++            "title": "Live Migration Max Downtime",
++            "type": "integer",
++            "minimum": 100,
++            "default": 500,
++            "description": "The maximum downtime allowed for live migration in milliseconds. If unspecified, this value defaults to 500ms. Minimum value is 100ms."
++        },
++        "sw:wrs:auto_recovery": {
++            "title": "Instance Auto Recovery",
++            "type": "boolean",
++            "default": "True",
++            "description": "Determines if the system will automatically recover failed virtual machine instances."
++        },
++        "sw:wrs:guest:heartbeat": {
++            "title": "Guest Heartbeat",
++            "description": "Enables the Heartbeat API for use by guests on the VM.",
++            "type": "boolean",
++            "default": "True"
++        },
++        "sw:wrs:srv_grp_messaging": {
++            "title": "Server Group Messaging",
++            "description": "Enables the VM to communicate with other VMs in the same server group using a messaging API.",
++            "type": "boolean",
++            "default": "True"
++        },
++        "sw:wrs:vtpm": {
++            "title": "vTPM",
++            "description": "Enables virtual TPM for guests.",
++            "type": "boolean",
++            "default": "True"
++        },
++        "sw:wrs:guest:hpet": {
++            "title": "Guest Hpet timer",
++            "description": "Enables the Hpet timer for use by guests.",
++            "type": "boolean",
++            "default": "False"
++        }
++    }
++}
+diff --git a/etc/metadefs/tis-live-migration-image.json b/etc/metadefs/tis-live-migration-image.json
+new file mode 100755
+index 0000000..8fe3643
+--- /dev/null
++++ b/etc/metadefs/tis-live-migration-image.json
+@@ -0,0 +1,35 @@
++{
++    "display_name": "WRS Live Migration Properties",
++    "namespace": "TiS::Compute::LiveMigrationImage",
++    "description": "When adding an image to Glance, you may specify Nova Live Migration properties of your image.",
++    "visibility": "public",
++    "protected": true,
++    "resource_type_associations" : [
++        {
++            "name": "OS::Glance::Image"
++        }
++    ],
++    "properties": {
++        "hw_wrs_live_migration_timeout": {
++            "title": "Live Migration Timeout",
++            "type": "string",
++            "pattern": "^0$|^(1[2-9][0-9]|[2-7]\\d\\d)$|^800$",
++            "default": "180",
++            "description": "The maximum time allowed for live migration. Set to 0 to disable timeout. If unspecified this value defaults to 180 seconds. The value should be in range [120, 800] or 0."
++        },
++        "hw_wrs_live_migration_max_downtime": {
++            "title": "Live Migration Max Downtime",
++            "type": "integer",
++            "minimum": 100,
++            "default": 500,
++            "description": "The maximum downtime allowed for live migration in milliseconds. If unspecified, this value defaults to 500ms. Minimum value is 100ms."
++        },
++        "sw_wrs_auto_recovery": {
++            "title": "Instance Auto Recovery",
++            "type": "boolean",
++            "default": "True",
++            "description": "Determines if the system will automatically recover failed virtual machine instances."
++        }
++    },
++    "objects": []
++}
+diff --git a/etc/metadefs/tis-live-migration-instance.json b/etc/metadefs/tis-live-migration-instance.json
+new file mode 100755
+index 0000000..885cdfb
+--- /dev/null
++++ b/etc/metadefs/tis-live-migration-instance.json
+@@ -0,0 +1,36 @@
++{
++    "display_name": "WRS Live Migration Properties",
++    "namespace": "TiS::Compute::LiveMigrationInstance",
++    "description": "When booting an instance, you may specify its Nova Live Migration properties.",
++    "visibility": "public",
++    "protected": true,
++    "resource_type_associations" : [
++        {
++            "name": "OS::Nova::Server",
++            "properties_target": "metadata"
++        }
++    ],
++    "properties": {
++        "hw:wrs:live_migration_timeout": {
++            "title": "Live Migration Timeout",
++            "type": "string",
++            "pattern": "^0$|^(1[2-9][0-9]|[2-7]\\d\\d)$|^800$",
++            "default": "180",
++            "description": "The maximum time allowed for live migration. Set to 0 to disable timeout. If unspecified this value defaults to 180 seconds. The value should be in range [120, 800] or 0."
++        },
++        "hw:wrs:live_migration_max_downtime": {
++            "title": "Live Migration Max Downtime",
++            "type": "integer",
++            "minimum": 100,
++            "default": 500,
++            "description": "The maximum downtime allowed for live migration in milliseconds. If unspecified, this value defaults to 500ms. Minimum value is 100ms."
++        },
++        "sw:wrs:auto_recovery": {
++            "title": "Instance Auto Recovery",
++            "type": "boolean",
++            "default": "True",
++            "description": "Determines if the system will automatically recover failed virtual machine instances."
++        }
++    },
++    "objects": []
++}
+diff --git a/etc/metadefs/tis-recovery-instance.json b/etc/metadefs/tis-recovery-instance.json
+new file mode 100755
+index 0000000..62fb6ff
+--- /dev/null
++++ b/etc/metadefs/tis-recovery-instance.json
+@@ -0,0 +1,24 @@
++{
++    "display_name": "WRS Recovery Properties",
++    "namespace": "TiS::Compute::RecoveryInstance",
++    "description": "When booting an instance, you may specify its Recovery properties.",
++    "visibility": "public",
++    "protected": true,
++    "resource_type_associations" : [
++        {
++            "name": "OS::Nova::Server",
++            "properties_target": "metadata"
++        }
++    ],
++    "properties": {
++        "sw:wrs:recovery_priority": {
++            "title": "Recovery Priority",
++            "type": "integer",
++            "minimum": 1,
++            "maximum": 10,
++            "default": 1,
++            "description": "The priority used to order the recovery of instances (1 is highest and 10 is lowest). If unspecified, this value defaults to 10."
++        }
++    },
++    "objects": []
++}
+-- 
+2.7.4
+

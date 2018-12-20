@@ -40,3 +40,4 @@ releasenotes/build
 .eric5project/
 .issues/
 .ropeproject
+stx-patches
