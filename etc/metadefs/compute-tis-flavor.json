@@ -91,6 +91,16 @@
             ],
             "default": "prefer" 
         },
+        "hw:wrs:pci_numa_affinity": {
+            "title": "PCI NUMA Affinity",
+            "description": "Specify how to select NUMA node(s) from host. Strict: requires a host NUMA node with direct access to a PCI interface.; Prefer: prefers a host NUMA node with direct access to a PCI interface. If none is available, another NUMA node can be used.",
+            "type": "string",
+            "enum": [
+                "strict",
+                "prefer"
+            ],
+            "default": "prefer"
+        },
         "hw:wrs:live_migration_timeout": {
             "title": "Live Migration Timeout",
             "type": "string",
